@@ -1,7 +1,7 @@
 {
   "name": "alpha-account-discovery-system",
   "version": "1.0.0",
-  "description": "Autonomous Alpha Account Discovery and Reputation System",
+  "description": "Zero-Configuration Alpha Account Discovery and Reputation System",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
