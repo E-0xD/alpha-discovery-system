@@ -3,10 +3,12 @@ import { Pool } from 'pg';
 import { Telegraf } from 'telegraf';
 import * as http from 'http';
 import * as dotenv from 'dotenv';
+import { Connection, Keypair, VersionedTransaction } from '@solana/web3.js';
+import b58 from 'bs58';
 
 dotenv.config();
 
-// 1. DATABASE & TELEGRAM INITIALIZATION
+// 1. SERVICES & ARCHITECTURAL INITIALIZATION
 const db = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
@@ -14,6 +16,18 @@ const db = new Pool({
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN || '');
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+
+// Web3 Connection Infrastructure
+const connection = new Connection(process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com', 'confirmed');
+let fundingWallet: Keypair | null = null;
+if (process.env.SOLANA_WALLET_PRIVATE_KEY) {
+  try {
+    fundingWallet = Keypair.fromSecretKey(b58.decode(process.env.SOLANA_WALLET_PRIVATE_KEY));
+    console.log(`🔑 Trading Core Synchronized. Execution Wallet: ${fundingWallet.publicKey.toBase58()}`);
+  } catch (e) {
+    console.error("❌ Critical: Failed to parse SOLANA_WALLET_PRIVATE_KEY. Auto-buy disabled.");
+  }
+}
 
 // 2. DATA STRUCTURAL INTERFACES
 interface TokenSignal {
@@ -24,21 +38,12 @@ interface TokenSignal {
   insiderRiskScore: number;
   narrativeStrength: number;
   classification: string;
+  marketCap: number;
 }
 
 // 3. SECURE TABLE DATABASE SCHEMA SYNCHRONIZER
 async function initDatabaseSchema() {
   try {
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS accounts (
-        username TEXT PRIMARY KEY,
-        priority_tier TEXT DEFAULT 'LOW',
-        reputation_score NUMERIC DEFAULT 50.0,
-        total_signals_tracked INT DEFAULT 0,
-        last_scanned TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-
     await db.query(`
       CREATE TABLE IF NOT EXISTS token_intelligence (
         token_address TEXT PRIMARY KEY,
@@ -49,10 +54,13 @@ async function initDatabaseSchema() {
         narrative_strength NUMERIC DEFAULT 0.0,
         classification TEXT DEFAULT 'ORGANIC',
         alert_sent BOOLEAN DEFAULT FALSE,
+        bought BOOLEAN DEFAULT FALSE,
+        buy_price_usd NUMERIC DEFAULT 0.0,
+        tokens_held NUMERIC DEFAULT 0.0,
+        highest_multiplier NUMERIC DEFAULT 1.0,
         last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
-
     console.log("🟩 Permanent Database Engine Sync Verified.");
   } catch (err) {
     console.error("❌ DB Initialization fail. Retrying...", err);
@@ -60,21 +68,128 @@ async function initDatabaseSchema() {
   }
 }
 
-// 4. CORE MATHEMATICAL INTELLIGENCE SCORING ENGINE
+// 4. CORE REPETITIVE PVP AND LORE SCRAPING FILTER
+function evaluatedLoreUniqueness(tokenAddress: string, description: string): boolean {
+  if (!description) return false;
+  
+  const formattedText = description.toLowerCase();
+  
+  // Strict algorithmic blocking of standard repetitive copy-paste meta hashes
+  const pvpRedFlags = [
+    'pvp', 'player vs player', 'fair launch', 'no dev', 'dev left', 
+    'community take over', 'cto', 'moon', '1000x', 'pump', 'chillguy'
+  ];
+  
+  const containsPvPMeta = pvpRedFlags.some(flag => formattedText.includes(flag));
+  if (containsPvPMeta) return false;
+
+  // Enforces structural depth of lore and narrative presentation parameters
+  const minimumLoreWordLength = 12;
+  const wordCount = description.split(/\s+/).length;
+  
+  return wordCount >= minimumLoreWordLength;
+}
+
+// 5. JUPITER AUTOMATED EXECUTION ENGINE PIPELINE (SWAP EXECUTOR)
+async function executeJupiterSwap(inputMint: string, outputMint: string, lamportsAmount: number): Promise<{ txid: string; priceUsd: number } | null> {
+  if (!fundingWallet) return null;
+  try {
+    const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${lamportsAmount}&slippageBps=150`;
+    const quoteRes = await axios.get(quoteUrl);
+    const quoteResponse = quoteRes.data;
+
+    if (!quoteResponse) return null;
+
+    const swapRes = await axios.post('https://quote-api.jup.ag/v6/swap', {
+      quoteResponse,
+      userPublicKey: fundingWallet.publicKey.toBase58(),
+      wrapAndUnwrapSol: true,
+    });
+
+    const { swapTransaction } = swapRes.data;
+    const swapTransactionBuf = Buffer.from(swapTransaction, 'base64');
+    const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
+    
+    transaction.sign([fundingWallet]);
+    
+    const txid = await connection.sendTransaction(transaction, { skipPreflight: false, preflightCommitment: 'confirmed' });
+    console.log(`⚡ Jupiter Auto-Trade Dispatched. Signature: ${txid}`);
+    
+    const outPriceEst = parseFloat(quoteResponse.outAmount) / Math.pow(10, 9);
+    const inPriceEst = lamportsAmount / Math.pow(10, 9);
+    const fallbackEntryPriceUsd = inPriceEst > 0 ? (inPriceEst / outPriceEst) * 145 : 0.00001;
+
+    return { txid, priceUsd: fallbackEntryPriceUsd };
+  } catch (error) {
+    console.error(`❌ Jupiter Auto-Buy Pipeline Failed for ${outputMint}:`, error);
+    return null;
+  }
+}
+
+// 6. TRACKING RISK & DYNAMIC TAKE-PROFIT CONTROLLER (POSITION MONITOR)
+async function processActivePositions() {
+  if (!fundingWallet) return;
+  try {
+    const activePositions = await db.query('SELECT * FROM token_intelligence WHERE bought = TRUE AND tokens_held > 0');
+    
+    for (const pos of activePositions.rows) {
+      const marketRes = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${pos.token_address}`);
+      const pairData = marketRes.data?.pairs?.[0];
+      if (!pairData) continue;
+
+      const currentPriceUsd = parseFloat(pairData.priceUsd || '0');
+      const entryPriceUsd = parseFloat(pos.buy_price_usd || '0');
+      if (entryPriceUsd <= 0 || currentPriceUsd <= 0) continue;
+
+      const currentMultiplier = currentPriceUsd / entryPriceUsd;
+      let highestMultiplier = Math.max(parseFloat(pos.highest_multiplier || '1.0'), currentMultiplier);
+
+      // SPECIFICATION: Initial Capital Recovery at 2.0x Return
+      if (highestMultiplier >= 2.0 && parseFloat(pos.highest_multiplier || '1.0') < 2.0) {
+        console.log(`🎯 Milestone Hit: 2x on $${pos.ticker}. Triggering initial capital recovery execution...`);
+        const totalTokensToSell = parseFloat(pos.tokens_held) * 0.5; 
+        
+        // FIXED: Shifted scaling metrics calculation upward to native 9-decimal precision strings
+        const sellResult = await executeJupiterSwap(pos.token_address, "So11111111111111111111111111111111111111112", Math.floor(totalTokensToSell * Math.pow(10, 9)));
+        
+        if (sellResult) {
+          await db.query('UPDATE token_intelligence SET tokens_held = tokens_held - $1, highest_multiplier = 2.0 WHERE token_address = $2', [totalTokensToSell, pos.token_address]);
+          await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, `💰 <b>CAPITAL EXTRACTED (2x)</b> 💰\n\nRecovered baseline capital investments on $${pos.ticker}. Remaining moonbag is running on pure profit.`);
+        }
+      }
+
+      // SPECIFICATION: Follow-Up Tier Scaling Engine: Sell 30% for every additional 2x increment achieved
+      const expectedNextTier = Math.floor(highestMultiplier / 2.0) * 2.0;
+      const lastRecordedTier = Math.floor(parseFloat(pos.highest_multiplier || '1.0') / 2.0) * 2.0;
+
+      if (expectedNextTier > lastRecordedTier && expectedNextTier >= 4.0) {
+        console.log(`🎯 Additional Profit Scaling Tier Triggered: ${expectedNextTier}x on $${pos.ticker}. Dumping 30%...`);
+        const totalTokensToSell = parseFloat(pos.tokens_held) * 0.30;
+        const sellResult = await executeJupiterSwap(pos.token_address, "So11111111111111111111111111111111111111112", Math.floor(totalTokensToSell * Math.pow(10, 9)));
+        
+        if (sellResult) {
+          await db.query('UPDATE token_intelligence SET tokens_held = tokens_held - $1, highest_multiplier = $2 WHERE token_address = $3', [totalTokensToSell, expectedNextTier, pos.token_address]);
+          await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, `📈 <b>TAKE PROFIT TIERS SCALED</b> 📈\n\nToken $${pos.ticker} reached ${expectedNextTier}x from entry. Scaled out 30% of position size to profits.`);
+        }
+      }
+    }
+  } catch (err) {
+    console.error("Error running tracking position matrices:", err);
+  }
+}
+
+// 7. CORE MATHEMATICAL INTELLIGENCE SCORING ENGINE
 function calculateAlphaMetrics(pairData: any): TokenSignal {
   const liquidity = parseFloat(pairData.liquidity?.usd || '0');
-  const volume24h = parseFloat(pairData.volume?.m5 || '0') * 12; // Extrapolated structural volume
-  const txCount24h = (pairData.txns?.m5?.buys || 0) + (pairData.txns?.m5?.sells || 0);
+  const volume24h = parseFloat(pairData.volume?.m5 || '0') * 12; 
+  const marketCap = parseFloat(pairData.fdv || pairData.marketCap || '0');
 
-  // Core logistical calculations
   let rugProbability = 0.15;
   if (liquidity < 15000) rugProbability += 0.35;
-  if (txCount24h < 10) rugProbability += 0.25;
 
   let alphaScore = 50;
   if (volume24h > 50000) alphaScore += 25;
   if (liquidity > 30000) alphaScore += 15;
-  if (rugProbability < 0.25) alphaScore += 10;
 
   const insiderRiskScore = liquidity < 20000 ? 45.0 : 15.0;
   const narrativeStrength = volume24h > 100000 ? 85.0 : 40.0;
@@ -86,11 +201,12 @@ function calculateAlphaMetrics(pairData: any): TokenSignal {
     rugProbability: Math.min(rugProbability, 1.0),
     insiderRiskScore,
     narrativeStrength,
-    classification: alphaScore > 75 ? 'HIGH_POTENTIAL_RUNNER' : 'ORGANIC'
+    classification: alphaScore > 75 ? 'HIGH_POTENTIAL_RUNNER' : 'ORGANIC',
+    marketCap
   };
 }
 
-// 5. THE ACTIVE INGESTION & SCANNING LOOP PIPELINE
+// 8. THE ACTIVE INGESTION & SCANNING LOOP PIPELINE
 async function scanSolanaTokenProfiles() {
   try {
     console.log("🔍 Extracting current token profiles from Solana stream...");
@@ -100,52 +216,99 @@ async function scanSolanaTokenProfiles() {
     for (const profile of incomingProfiles) {
       if (profile.chainId !== 'solana' || !profile.tokenAddress) continue;
 
-      // Rule 1: Strict Verification of attached Twitter/X links
       const hasTwitter = profile.links?.some((l: any) => l.type === 'twitter' || l.url?.includes('x.com') || l.url?.includes('twitter.com'));
       if (!hasTwitter) continue;
 
-      // Gather corresponding pair trading data fields
+      const passesLoreCheck = evaluatedLoreUniqueness(profile.tokenAddress, profile.description || '');
+      if (!passesLoreCheck) continue;
+
       const marketRes = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${profile.tokenAddress}`);
       const pairData = marketRes.data?.pairs?.[0];
       if (!pairData) continue;
 
-      // Run mathematical alpha calculation matrix
       const metrics = calculateAlphaMetrics(pairData);
 
-      // Check if this token was already added or alerted to avoid duplicate spam
-      const checkDup = await db.query('SELECT alert_sent FROM token_intelligence WHERE token_address = $1', [profile.tokenAddress]);
+      // FILTER GATE 1: Rigid Market Cap Guardrails (Min: 7k, Max: 100k)
+      if (metrics.marketCap < 7000 || metrics.marketCap > 100000) continue;
+
+      // FILTER GATE 2: Track For Aggressive Developer Dumping Mechanics
+      const sellRatio5m = pairData.txns?.m5?.sells || 0;
+      const buyRatio5m = pairData.txns?.m5?.buys || 0;
+      const totalRatio = buyRatio5m + sellRatio5m;
+      if (totalRatio > 5 && (sellRatio5m / totalRatio) > 0.65) {
+        console.log(`⚠️ Dumping Flagged: Skipping $${metrics.ticker} due to high corrections sell volume ratio.`);
+        continue; 
+      }
+
+      const checkDup = await db.query('SELECT alert_sent, bought FROM token_intelligence WHERE token_address = $1', [profile.tokenAddress]);
       
       if (checkDup.rows.length === 0) {
-        // Save the tracked entity parameters to Supabase
         await db.query(`
           INSERT INTO token_intelligence (token_address, ticker, alpha_score, rug_probability, insider_risk_score, narrative_strength, classification, alert_sent)
           VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE)
         `, [metrics.tokenAddress, metrics.ticker, metrics.alphaScore, metrics.rugProbability, metrics.insiderRiskScore, metrics.narrativeStrength, metrics.classification]);
       }
 
-      // Rule 2 & 3: Strict Score Gating thresholds before alerting Telegram
       if (metrics.alphaScore >= 65 && metrics.rugProbability < 0.35) {
         const alreadyAlerted = checkDup.rows[0]?.alert_sent || false;
+        const alreadyBought = checkDup.rows[0]?.bought || false;
         
+        // EXECUTE AUTOMATED ALLOCATION ENGINE
+        let buySuccessString = "⚠️ Auto-Buy Bypassed (Inactive Wallet Configuration Key)";
+        
+        if (!alreadyBought && fundingWallet) {
+          try {
+            const walletBalanceLamports = await connection.getBalance(fundingWallet.publicKey);
+            const allocationLamports = Math.floor(walletBalanceLamports * 0.20);
+            
+            if (allocationLamports > 5000000) { 
+              const tradeReceipt = await executeJupiterSwap("So11111111111111111111111111111111111111112", metrics.tokenAddress, allocationLamports);
+              if (tradeReceipt) {
+                buySuccessString = `🟢 <b>AUTO-BUY EXECUTED</b>\nAllocated 20% Wallet Balance\nTx: <code>${tradeReceipt.txid}</code>`;
+                
+                await db.query(`
+                  UPDATE token_intelligence 
+                  SET bought = TRUE, buy_price_usd = $1, tokens_held = $2 
+                  WHERE token_address = $3
+                `, [tradeReceipt.priceUsd, 1000000000, metrics.tokenAddress]); 
+              } else {
+                buySuccessString = "❌ Auto-Buy Execution Blocked (Route Liquidity Issue)";
+              }
+            } else {
+              buySuccessString = "❌ Auto-Buy Skipped (Insufficient Solana Core Reserves)";
+            }
+          } catch (tradeErr) {
+            console.error("Trade transaction logic integration error:", tradeErr);
+          }
+        }
+
         if (!alreadyAlerted && TELEGRAM_CHAT_ID) {
-          const message = `🚨 <b>AUTONOMOUS AI DEGEN CALL</b> 🚨\n\n` +
+          const deployerWallet = profile.deployer || "PumpFun_Contract_Agent";
+          
+          // CRITICAL FEATURE: Injected live formatted Market Cap calculation output directly into telemetry block
+          const formattedMCAP = metrics.marketCap > 0 ? `$${metrics.marketCap.toLocaleString()}` : "Calculating...";
+
+          const message = `🚨 <b>AUTONOMOUS AI LORE DEGEN CALL</b> 🚨\n\n` +
                           `<b>Token:</b> $${metrics.ticker}\n` +
-                          `<b>Address:</b> <code>${metrics.tokenAddress}</code>\n\n` +
+                          `<b>Address:</b> <code>${metrics.tokenAddress}</code>\n` +
+                          `<b>Market Cap:</b> 💰 <b>${formattedMCAP}</b>\n\n` +
+                          `🤖 <b>Execution State:</b>\n${buySuccessString}\n\n` +
+                          `👨‍💻 <b>Deployer Metrics:</b>\n` +
+                          `• Wallet: <code>${deployerWallet}</code>\n` +
+                          `• Story Check: 📚 <i>Unique Narrative Validated</i>\n\n` +
                           `📊 <b>AI Intelligence Matrix:</b>\n` +
                           `• Alpha Score: 🟢 <b>${metrics.alphaScore}/100</b>\n` +
                           `• Rug Probability: 🛡️ <b>${(metrics.rugProbability * 100).toFixed(0)}%</b>\n` +
-                          `• Insider Risk: ⚠️ <b>${metrics.insiderRiskScore}%</b>\n` +
                           `• Dynamic Mode: ⚡ <code>${metrics.classification}</code>\n\n` +
                           `📱 <a href="https://dexscreener.com/solana/${metrics.tokenAddress}">Monitor Chart Live</a>`;
 
-          // FIXED: Avoided modern property errors by using type assertions to pass compatibility tags
+          // FIXED: Forced a type asset projection fallback rule on configuration fields to protect runtime parameters
           await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, message, { 
             parse_mode: 'HTML', 
             disable_web_page_preview: true 
           } as any);
 
           await db.query('UPDATE token_intelligence SET alert_sent = TRUE WHERE token_address = $1', [metrics.tokenAddress]);
-          console.log(`🟩 Broadcast Alert successfully dispatched to Telegram for $${metrics.ticker}`);
         }
       }
     }
@@ -154,7 +317,7 @@ async function scanSolanaTokenProfiles() {
   }
 }
 
-// 6. MASTER ENGINE INITIALIZER BOOTSTRAPPER
+// 9. MASTER ENGINE INITIALIZER BOOTSTRAPPER
 async function main() {
   await initDatabaseSchema();
 
@@ -162,19 +325,17 @@ async function main() {
     bot.launch().then(() => console.log("🤖 Telegram Integration Service Online. Listening..."));
   }
 
-  // Interval trigger scanning loops every 3 minutes
+  // Active Monitoring Cycles
   setInterval(scanSolanaTokenProfiles, 1000 * 60 * 3);
-  // Optional initial scan on startup
+  setInterval(processActivePositions, 1000 * 30); 
+  
   scanSolanaTokenProfiles();
 
-  // Web service listener to keep Render container port awake
   const port = process.env.PORT || 3000;
   http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ bot: "alpha-degen-bot-v2", active: true }));
-  }).listen(port, () => {
-    console.log(`📡 Render Container runtime web hook listener pinned to port [${port}]`);
-  });
+    res.end(JSON.stringify({ bot: "alpha-degen-bot-v3", active: true }));
+  }).listen(port);
 }
 
 main().catch(console.error);
