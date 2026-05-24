@@ -1,16 +1,17 @@
 {
-  "name": "alpha-account-discovery-system",
-  "version": "1.0.0",
-  "description": "Zero-Configuration Alpha Account Discovery and Reputation System",
-  "main": "dist/index.js",
+  "name": "alpha-intelligence-telegram-bot",
+  "version": "2.0.0",
+  "description": "Autonomous AI Intelligence Degen Trading Bot Core Engine",
+  "main": "dist/bot.js",
   "scripts": {
     "build": "tsc",
-    "start": "tsc && node dist/index.js"
+    "start": "tsc && node dist/bot.js"
   },
   "dependencies": {
     "axios": "^1.7.2",
     "dotenv": "^16.4.5",
-    "pg": "^8.11.5"
+    "pg": "^8.11.5",
+    "telegraf": "^4.16.3"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
