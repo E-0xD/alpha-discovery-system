@@ -16,6 +16,11 @@ export interface PatternMetrics {
   smartCohortPresence: boolean;
   passedPatterns: boolean;
   reason?: string;
+  // ✅ New real fields from Helius
+  washTradingDetected: boolean;
+  buyerVelocity: 'HIGH' | 'MEDIUM' | 'LOW';
+  uniqueBuyers: number;
+  isPumpFun: boolean;
 }
 
 export interface Position {
@@ -24,7 +29,7 @@ export interface Position {
   entryPriceUsd: number;
   currentPriceUsd: number;
   sizeSol: number;
-  tokensHeld: string; // Stored as a string to preserve precision
+  tokensHeld: string;
   status: 'OPEN' | 'CLOSED';
   highestPriceUsd: number;
   timestamp: number;
