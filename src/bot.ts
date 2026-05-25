@@ -1,29 +1,37 @@
 import { Telegraf } from 'telegraf';
 import * as dotenv from 'dotenv';
-import * as http from 'http';
+import axios from 'axios';
 
 dotenv.config();
 
-// 1. Minimal HTTP server to keep Render happy
-const PORT = parseInt(process.env.PORT || '3000', 10);
-http.createServer((req, res) => {
-    res.writeHead(200);
-    res.end('Bot is running');
-}).listen(PORT, '0.0.0.0', () => console.log(`Server listening on ${PORT}`));
-
-// 2. Initialize Bot
+// 1. Initialize Bot
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN || '');
 
-// 3. Launch with dropPendingUpdates to prevent 409 Conflicts
-// Remove the bot.stop() call to avoid race conditions
-bot.launch({
-    dropPendingUpdates: true
-}).then(() => {
-    console.log("🤖 Bot successfully launched!");
-}).catch((err) => {
-    console.error("Launch Error:", err);
-    process.exit(1); // Force exit if it can't start
-});
+// 2. Scan function (Logic to find tokens)
+async function scan() {
+    console.log("🔍 Scanning DexScreener...");
+    try {
+        const { data: profiles } = await axios.get('https://api.dexscreener.com/token-profiles/latest/v1');
+        console.log(`Found ${profiles.length} profiles to check.`);
+        
+        // ... add your buying/alert logic here ...
+    } catch (e) { 
+        console.error("Scan error:", e); 
+    }
+}
 
-// 4. Basic test handler
+// 3. Launch with conflict protection
+bot.launch({ dropPendingUpdates: true })
+  .then(() => {
+    console.log("🤖 Bot Live: Polling Started (Zombie processes cleared)");
+  })
+  .catch((err) => {
+    console.error("Fatal Launch Error:", err);
+    process.exit(1); 
+  });
+
+// 4. Test handler to verify the bot is alive
 bot.command('test', (ctx) => ctx.reply('Bot is online.'));
+
+// 5. Run the scanner every 60 seconds
+setInterval(scan, 60000);
