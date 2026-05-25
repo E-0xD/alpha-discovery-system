@@ -84,3 +84,13 @@ bot.launch().then(() => {
 });
 
 setInterval(scan, 1000 * 60 * 1);
+
+// REPLACE YOUR EXISTING BOT.LAUNCH SECTION WITH THIS:
+bot.launch({
+  dropPendingUpdates: true, // This clears the "stuck" conflict
+}).then(() => {
+  console.log("🤖 Bot Live - Polling Started");
+}).catch((err) => {
+  console.error("Failed to launch bot:", err);
+});
+
