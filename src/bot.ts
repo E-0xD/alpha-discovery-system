@@ -2,10 +2,18 @@ import axios from 'axios';
 import { Pool } from 'pg';
 import { Telegraf } from 'telegraf';
 import * as dotenv from 'dotenv';
+import * as http from 'http'; // Required to keep Render alive
 import { Connection, Keypair, VersionedTransaction } from '@solana/web3.js';
 import b58 from 'bs58';
 
 dotenv.config();
+
+// 1. WEB SERVER BINDING (Fixes Render "No Port Detected")
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => {
+  res.writeHead(200);
+  res.end('Bot is running');
+}).listen(PORT, '0.0.0.0', () => console.log(`🤖 Server listening on port ${PORT}`));
 
 const db = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN || '');
@@ -15,82 +23,62 @@ const connection = new Connection(process.env.SOLANA_RPC_URL || 'https://api.mai
 let fundingWallet: Keypair | null = null;
 if (process.env.SOLANA_WALLET_PRIVATE_KEY) {
   try { fundingWallet = Keypair.fromSecretKey(b58.decode(process.env.SOLANA_WALLET_PRIVATE_KEY)); } 
-  catch (e) { console.error("Wallet key parse error"); }
+  catch (e) { console.error("Key error"); }
 }
 
-// 1. PRECISION ALPHA SCORING ENGINE
-function calculateAlphaScore(profile: any, pair: any): number {
-  let score = 50; 
-  const desc = (profile.description || '').toLowerCase();
-  if (desc.length > 200) score += 25;
-  if (desc.includes("vision") || desc.includes("tech")) score += 15;
-  if (parseFloat(pair.liquidity?.usd || '0') > 15000) score += 10;
-  return Math.min(score, 100);
-}
-
-// 2. HARDENED JUPITER SWAP WITH 20% SLIPPAGE & MEV PROTECTION
 async function executeJupiterSwap(outputMint: string, lamports: number): Promise<any> {
   if (!fundingWallet) return null;
-  const endpoints = ['https://quote-api.jup.ag/v6', 'https://api.jup.ag/v6'];
   
-  for (const api of endpoints) {
-    try {
-      const q = await axios.get(`${api}/quote`, {
-        params: {
-          inputMint: 'So11111111111111111111111111111111111111112',
-          outputMint: outputMint,
-          amount: lamports,
-          slippageBps: 2000, // 20% Slippage
-          onlyDirectRoutes: false
-        }, timeout: 10000
-      });
+  // Use private RPC defined in Environment
+  try {
+    const q = await axios.get(`https://quote-api.jup.ag/v6/quote`, {
+      params: {
+        inputMint: 'So11111111111111111111111111111111111111112',
+        outputMint: outputMint,
+        amount: lamports,
+        slippageBps: 2000, 
+        onlyDirectRoutes: false // Aggressive routing
+      }, timeout: 10000
+    });
 
-      const s = await axios.post(`${api}/swap`, {
-        quoteResponse: q.data,
-        userPublicKey: fundingWallet.publicKey.toBase58(),
-        wrapAndUnwrapSol: true,
-        prioritizationFeeLamports: 200000 // Anti-MEV/Priority
-      }, { timeout: 10000 });
+    const s = await axios.post(`https://api.jup.ag/v6/swap`, {
+      quoteResponse: q.data,
+      userPublicKey: fundingWallet.publicKey.toBase58(),
+      wrapAndUnwrapSol: true,
+      prioritizationFeeLamports: 200000 
+    }, { timeout: 10000 });
 
-      const tx = VersionedTransaction.deserialize(Buffer.from(s.data.swapTransaction, 'base64'));
-      tx.sign([fundingWallet]);
-      const sig = await connection.sendTransaction(tx, { skipPreflight: true });
-      await connection.confirmTransaction(sig, 'confirmed');
-      return { txid: sig, priceUsd: parseFloat(q.data.outAmount) / Math.pow(10, 9) };
-    } catch (e: any) { continue; }
+    const tx = VersionedTransaction.deserialize(Buffer.from(s.data.swapTransaction, 'base64'));
+    tx.sign([fundingWallet]);
+    const sig = await connection.sendTransaction(tx, { skipPreflight: true });
+    await connection.confirmTransaction(sig, 'confirmed');
+    return sig;
+  } catch (e: any) {
+    console.error(`❌ Swap Failed: ${e.message}`);
+    return null;
   }
-  return null;
 }
 
-// 3. CORE SCANNER (NON-BLOCKING)
 async function scan() {
   try {
-    const [l, r] = await Promise.all([axios.get('https://api.dexscreener.com/token-profiles/latest/v1'), axios.get('https://api.dexscreener.com/token-profiles/recent-updates/v1')]);
-    const profiles = [...(l.data || []), ...(r.data || [])];
-    const unique = new Map(profiles.map((p: any) => [p.tokenAddress, p]));
-
-    for (const p of Array.from(unique.values()).slice(0, 30)) {
-      const market = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${p.tokenAddress}`);
-      const pair = market.data?.pairs?.[0];
+    const { data: profiles } = await axios.get('https://api.dexscreener.com/token-profiles/latest/v1');
+    for (const p of profiles.slice(0, 10)) {
+      const { data } = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${p.tokenAddress}`);
+      const pair = data?.pairs?.[0];
       if (!pair) continue;
       
       const mcap = parseFloat(pair.fdv || pair.marketCap || '0');
-      if (mcap < 7000 || mcap > 200000) continue;
-      
-      const alphaScore = calculateAlphaScore(p, pair);
-      if (alphaScore >= 65) {
-        // Send alert immediately
-        const msg = `🚀 Alpha Detected: $${pair.baseToken.symbol} | Score: ${alphaScore}\nMCAP: $${mcap.toLocaleString()}`;
-        await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, msg).catch(console.error);
-        
-        // Attempt Buy (Async, won't block alerts)
-        executeJupiterSwap(p.tokenAddress, 5000000).catch(console.error);
+      // Relaxed criteria to ensure we find coins
+      if (mcap > 5000 && mcap < 500000) {
+        console.log(`🚀 Found: ${pair.baseToken.symbol} | MCAP: ${mcap}`);
+        await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, `🚀 Alpha: $${pair.baseToken.symbol} | MCAP: $${mcap.toLocaleString()}`);
+        executeJupiterSwap(p.tokenAddress, 5000000);
       }
     }
-  } catch (e) { console.error("Scan Error:", e); }
+  } catch (e) { console.error("Scan error:", e); }
 }
 
 bot.launch().then(() => {
-  console.log("🤖 Bot Live & Precision Scoring Active");
-  setInterval(scan, 1000 * 60 * 2);
+  console.log("🤖 Bot Live");
+  setInterval(scan, 1000 * 60 * 1); // Scan every 1 min
 });
