@@ -25,6 +25,10 @@ http.createServer((_, res) => {
   console.log(`✅ Health check server on port ${PORT}`);
 });
 
+function escape(text: string): string {
+  return String(text).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+}
+
 function getDynamicMode(score: number): string {
   if (score >= 90) return '⚡ HIGH_POTENTIAL_RUNNER';
   if (score >= 75) return '⚡ ORGANIC';
@@ -86,16 +90,16 @@ async function scan() {
           }
         } else {
           const blockReason = !risk.allow ? risk.reason : pattern.reason;
-          executionState = `❌ Auto-Buy Blocked: ${blockReason}`;
+          executionState = `❌ Auto-Buy Blocked: ${escape(blockReason || '')}`;
         }
 
         const msg = `
 🚨🚨 *AUTONOMOUS AI DEGEN CALL* 🚨🚨
 
-*Token:* $${ticker}
+*Token:* $${escape(ticker)}
 *Address:* \`${address}\`
-*Market Cap:* 💰 $${mcap.toLocaleString()}
-*Liquidity:* $${liquidity.toLocaleString()}
+*Market Cap:* 💰 $${escape(mcap.toLocaleString())}
+*Liquidity:* $${escape(liquidity.toLocaleString())}
 
 🤖 *Execution State:*
 ${executionState}
