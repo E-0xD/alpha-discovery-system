@@ -1,6 +1,7 @@
 import { Telegraf } from 'telegraf';
 import * as dotenv from 'dotenv';
 import axios from 'axios';
+import * as http from 'http';
 import { OnChainPatternRecognition } from './intelligence';
 import { CapitalRiskEngine } from './risk';
 import { LowLatencyExecutionEngine } from './execution';
@@ -14,6 +15,15 @@ const riskEngine = new CapitalRiskEngine();
 const executor = new LowLatencyExecutionEngine();
 
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+
+// Keep Render Web Service alive
+const PORT = process.env.PORT || 3000;
+http.createServer((_, res) => {
+  res.writeHead(200);
+  res.end('Bot is running');
+}).listen(PORT, () => {
+  console.log(`✅ Health check server on port ${PORT}`);
+});
 
 function getDynamicMode(score: number): string {
   if (score >= 90) return '⚡ HIGH_POTENTIAL_RUNNER';
@@ -42,7 +52,6 @@ async function scan() {
 
         console.log(`Checking ${ticker}: MCAP $${mcap}`);
 
-        // Build signal
         const rugProb = mcap < 20000 ? 0.25 : 0.12;
         const alphaScore = Math.min(100, Math.floor((liquidity / mcap) * 300 + 60));
 
@@ -55,15 +64,12 @@ async function scan() {
           marketCapUsd: mcap,
         };
 
-        // Run all 3 engines
         const [pattern, risk] = await Promise.all([
           intelligence.analyzePattern(signal),
           riskEngine.validateExecutionRisk(signal),
         ]);
 
-        // Execution
         let executionState = '';
-        let bundleId = '';
 
         if (risk.allow && pattern.passedPatterns) {
           try {
@@ -72,7 +78,6 @@ async function scan() {
             const result = await executor.dispatchMevProtectedBundle(tx);
             if (result.success) {
               executionState = `✅ Auto-Buy Executed | Bundle: ${result.bundleId}`;
-              bundleId = result.bundleId || '';
             } else {
               executionState = `❌ Auto-Buy Failed: ${result.error}`;
             }
@@ -84,7 +89,6 @@ async function scan() {
           executionState = `❌ Auto-Buy Blocked: ${blockReason}`;
         }
 
-        // Send rich alert
         const msg = `
 🚨🚨 *AUTONOMOUS AI DEGEN CALL* 🚨🚨
 
