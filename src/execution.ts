@@ -65,15 +65,15 @@ export class LowLatencyExecutionEngine {
   }
 
   public async dispatchMevProtectedBundle(tx: VersionedTransaction): Promise<{ success: boolean; bundleId?: string; error?: string }> {
-    // Try Jito first
+        // Try Jito first
     try {
-      // ✅ Jito officially recommends base64 formatting now
-      const serializedTx = Buffer.from(tx.serialize()).toString('base64');
+      // ✅ Reverted to native base58 (The Base64 "upgrade" broke Jito's decoder)
+      const serializedTx = bs58.encode(tx.serialize());
       const payload = {
         jsonrpc: "2.0",
         id: 1,
         method: "sendBundle",
-        params: [[serializedTx]] // Clean array, no encoding tags needed
+        params: [[serializedTx]] // Clean array, perfectly readable by Jito
       };
 
       const res = await this.client.post(this.jitoBundleEndpoint, payload, {
@@ -96,6 +96,7 @@ export class LowLatencyExecutionEngine {
       console.log("🔥 JITO REJECTION REASON:", JSON.stringify(e.response?.data || e.message));
       console.log(`⚠️ Jito failed — falling back to direct RPC`);
     }
+
 
     // ✅ Direct RPC fallback — most reliable
     return this.fallbackToQuickNode(tx.serialize());
