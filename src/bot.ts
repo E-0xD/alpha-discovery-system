@@ -6,6 +6,8 @@ import { OnChainPatternRecognition } from './intelligence';
 import { CapitalRiskEngine } from './risk';
 import { LowLatencyExecutionEngine } from './execution';
 import { TokenSignal } from './types';
+import Redis from 'ioredis';
+const redis = new Redis(process.env.REDIS_URL || '');
 
 dotenv.config();
 
