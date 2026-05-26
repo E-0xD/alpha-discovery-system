@@ -1,6 +1,7 @@
 import { Telegraf, Markup } from 'telegraf';
 import * as dotenv from 'dotenv';
 import axios from 'axios';
+import WebSocket from 'ws';
 import { OnChainPatternRecognition } from './intelligence';
 import { CapitalRiskEngine } from './risk';
 import { LowLatencyExecutionEngine } from './execution';
@@ -18,6 +19,9 @@ const PORT = Number(process.env.PORT) || 10000;
 const DOMAIN = process.env.RENDER_EXTERNAL_URL || 'https://alpha-discovery-system.onrender.com';
 
 const seenTokens = new Set<string>();
+
+// ✅ NEW: WebSocket Queue for Pump.fun tokens
+const wssPumpTokensQueue: any[] = [];
 
 interface Position {
   ticker: string;
@@ -93,10 +97,43 @@ function isReversalCandidate(pair: any): boolean {
   return dumpedHard && (recoveringH1 || recoveringH6) && volumeReturning;
 }
 
-// ✅ UPGRADED: Multi-source live price — Jupiter first, pump.fun second, DexScreener fallback
-async function getLivePrice(address: string): Promise<{ price: number; mcap: number }> {
+// ✅ NEW: Background WebSocket Listener for Pump.fun
+function startPumpPortalStream() {
+    console.log("🔗 Connecting to PumpPortal WSS (Bypassing Cloudflare)...");
+    const ws = new WebSocket('wss://pumpportal.fun/api/data');
 
-  // Source 1: Jupiter Price API v2 — reads directly from on-chain pools, ~1-2s fresh
+    ws.on('open', () => {
+        console.log("🟢 WSS Connected! Streaming new token launches...");
+        ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
+    });
+
+    ws.on('message', (data: any) => {
+        try {
+            const token = JSON.parse(data.toString());
+            if (token.mint && token.symbol) {
+                // Push to queue for the next scan() loop to pick up
+                wssPumpTokensQueue.push({
+                    tokenAddress: token.mint,
+                    source: 'pumpfun-new',
+                    cachedMcap: token.vSolInBondingCurve || 30000, 
+                    cachedName: token.symbol,
+                    createdAt: Date.now()
+                });
+            }
+        } catch (e) {}
+    });
+
+    ws.on('close', () => {
+        console.log("🔴 WSS Disconnected. Reconnecting...");
+        setTimeout(startPumpPortalStream, 5000);
+    });
+
+    ws.on('error', (err: any) => {
+        console.error("⚠️ WSS Error:", err.message);
+    });
+}
+
+async function getLivePrice(address: string): Promise<{ price: number; mcap: number }> {
   try {
     const jupRes = await axios.get(
       `https://api.jup.ag/price/v2?ids=${address}`,
@@ -104,11 +141,13 @@ async function getLivePrice(address: string): Promise<{ price: number; mcap: num
     );
     const jupPrice = parseFloat(jupRes.data?.data?.[address]?.price || '0');
     if (jupPrice > 0) {
-      // Jupiter doesn't return mcap so fetch that separately from pump.fun
       try {
         const pumpRes = await axios.get(
           `https://frontend-api.pump.fun/coins/${address}`,
-          { timeout: 3000 }
+          { 
+            timeout: 3000,
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36' } // Anti-530 Band-Aid
+          }
         );
         const mcap = parseFloat(pumpRes.data?.usd_market_cap || '0');
         return { price: jupPrice, mcap };
@@ -118,18 +157,19 @@ async function getLivePrice(address: string): Promise<{ price: number; mcap: num
     }
   } catch {}
 
-  // Source 2: Pump.fun frontend API — often more current than DexScreener for pump tokens
   try {
     const pumpRes = await axios.get(
       `https://frontend-api.pump.fun/coins/${address}`,
-      { timeout: 4000 }
+      { 
+        timeout: 4000,
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36' }
+      }
     );
     const price = parseFloat(pumpRes.data?.price || pumpRes.data?.sol_price || '0');
     const mcap = parseFloat(pumpRes.data?.usd_market_cap || '0');
     if (price > 0) return { price, mcap };
   } catch {}
 
-  // Source 3: DexScreener — fallback only
   try {
     const dexRes = await axios.get(
       `https://api.dexscreener.com/latest/dex/tokens/${address}`,
@@ -144,7 +184,6 @@ async function getLivePrice(address: string): Promise<{ price: number; mcap: num
   return { price: 0, mcap: 0 };
 }
 
-// ✅ UPGRADED: 30 second polling, parallel fetches, multi-source prices
 async function monitorPositions() {
   const now = Date.now();
   const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
@@ -161,21 +200,14 @@ async function monitorPositions() {
 
   if (allAddresses.size === 0) return;
 
-  // Fetch all prices in parallel — no waiting one by one
   await Promise.all(Array.from(allAddresses).map(async (address) => {
     try {
       const { price: currentPrice, mcap: currentMcap } = await getLivePrice(address);
       if (!currentPrice) return;
 
-      // Update alert history
       if (alertHistory.has(address)) {
         const rec = alertHistory.get(address)!;
-        const updated: AlertRecord = {
-          ...rec,
-          currentPrice,
-          currentMcap,
-          lastUpdated: now
-        };
+        const updated: AlertRecord = { ...rec, currentPrice, currentMcap, lastUpdated: now };
         if (currentPrice > rec.peakPrice) {
           updated.peakPrice = currentPrice;
           updated.peakMcap = currentMcap;
@@ -185,7 +217,6 @@ async function monitorPositions() {
         alertHistory.set(address, updated);
       }
 
-      // Update open positions + check exit
       if (openPositions.has(address)) {
         const pos = openPositions.get(address)!;
         const updated = { ...pos };
@@ -265,26 +296,15 @@ async function scan() {
       console.log(`⚠️ PumpSwap failed: ${psErr.message}`);
     }
 
-    // ── SOURCE 3: pump.fun newest tokens ──
+    // ── SOURCE 3: pump.fun newest tokens (NOW WSS POWERED) ──
     let newPumpTokens: any[] = [];
     try {
-      const newRes = await axios.get(
-        'https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false',
-        { timeout: 10000 }
-      );
-      const coins = newRes.data || [];
-      newPumpTokens = coins
-        .filter((c: any) => c.mint && typeof c.mint === 'string')
-        .map((c: any) => ({
-          tokenAddress: c.mint,
-          source: 'pumpfun-new',
-          cachedMcap: c.usd_market_cap || 0,
-          cachedName: c.symbol || 'UNKNOWN',
-          createdAt: c.created_timestamp || 0
-        }));
-      console.log(`Pump.fun new: ${newPumpTokens.length} tokens`);
+      // Drain the queue of tokens collected via WSS since the last minute
+      newPumpTokens = [...wssPumpTokensQueue];
+      wssPumpTokensQueue.length = 0; // Clear the queue for the next cycle
+      console.log(`Pump.fun new (via WSS): ${newPumpTokens.length} tokens`);
     } catch (nErr: any) {
-      console.log(`⚠️ Pump.fun new failed: ${nErr.message}`);
+      console.log(`⚠️ Pump.fun WSS queue error: ${nErr.message}`);
     }
 
     // ── SOURCE 4: DexScreener new pairs (last 2hrs) ──
@@ -463,7 +483,6 @@ async function scan() {
           executionState = `❌ Auto\\-Buy Blocked: ${escapeText(risk.reason || '')}`;
         }
 
-        // Record in alert history for /pnl
         alertHistory.set(address, {
           ticker, address,
           alertTime: Date.now(),
@@ -541,13 +560,15 @@ bot.launch({
   webhook: { domain: DOMAIN, port: PORT }
 }).then(() => {
   console.log(`🤖 Bot Live via Webhook on port ${PORT}`);
+  
+  // ✅ NEW: Start the WebSocket listener on launch
+  startPumpPortalStream(); 
+  
   scan();
   setInterval(scan, 60000);
 
-  // ✅ PnL monitor every 30 seconds with live prices
   setInterval(monitorPositions, 30 * 1000);
 
-  // Self-ping every 5 minutes
   setInterval(async () => {
     try {
       await axios.get(DOMAIN, { timeout: 5000 });
@@ -560,7 +581,7 @@ bot.launch({
   process.exit(1);
 });
 
-bot.command('test', (ctx) => ctx.reply('✅ Bot online. Scanning pump.fun + PumpSwap + Early Detection + Reversals.'));
+bot.command('test', (ctx) => ctx.reply('✅ Bot online. Scanning pump.fun (via WSS) + PumpSwap + Early Detection + Reversals.'));
 
 bot.command('positions', async (ctx) => {
   if (openPositions.size === 0) return ctx.reply('📭 No open positions.');
