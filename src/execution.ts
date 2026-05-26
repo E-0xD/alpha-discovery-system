@@ -51,9 +51,7 @@ export class LowLatencyExecutionEngine {
       quoteResponse: quoteRes.data,
       userPublicKey: this.wallet.publicKey.toBase58(),
       wrapAndUnwrapSol: true,
-      computeUnitPriceMicroLamports: 60000,
-      dynamicSlippage: { "minBps": 50, "maxBps": 1000 },
-      prioritizationFeeLamports: "auto"
+      computeUnitPriceMicroLamports: 60000
     }, { timeout: 8000 });
 
     const swapBuffer = Buffer.from(swapTxRes.data.swapTransaction, 'base64');
@@ -61,34 +59,124 @@ export class LowLatencyExecutionEngine {
   }
 
   public async dispatchMevProtectedBundle(tx: VersionedTransaction): Promise<{ success: boolean; bundleId?: string; error?: string }> {
+    // Try Jito first
     try {
       const serializedTx = bs58.encode(tx.serialize());
-      const payload = { jsonrpc: "2.0", id: 1, method: "sendBundle", params: [[serializedTx]] };
-      const res = await this.client.post(this.jitoBundleEndpoint, payload, { headers: { 'Content-Type': 'application/json' }, timeout: 8000 });
+      const payload = {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "sendBundle",
+        params: [[serializedTx]]
+      };
+
+      const res = await this.client.post(this.jitoBundleEndpoint, payload, {
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 8000
+      });
+
       if (res.data?.result) {
         const bundleId = res.data.result;
-        this.confirmJitoBundle(bundleId).catch(() => {});
+        // ✅ Confirm in background — does not block scan
+        this.confirmJitoBundle(bundleId).then(confirmed => {
+          if (!confirmed) console.log(`⚠️ Jito bundle ${bundleId} did not confirm on-chain`);
+          else console.log(`✅ Jito bundle ${bundleId} confirmed on-chain`);
+        });
+        // Return immediately — don't wait for confirmation
         return { success: true, bundleId };
       }
-    } catch (e: any) { console.log(`⚠️ Jito failed: ${e.message}`); }
+    } catch (e: any) {
+      console.log(`⚠️ Jito failed: ${e.message} — falling back to direct RPC`);
+    }
+
+    // ✅ Direct RPC fallback — most reliable
     return this.fallbackToQuickNode(tx.serialize());
   }
 
+  // ✅ Jito bundle confirmation — runs in background
   private async confirmJitoBundle(bundleId: string): Promise<boolean> {
     try {
       await new Promise(resolve => setTimeout(resolve, 5000));
-      const res = await this.client.post('https://mainnet.block-engine.jito.wtf/api/v1/getBundleStatuses', { jsonrpc: "2.0", id: 1, method: "getBundleStatuses", params: [[bundleId]] }, { timeout: 8000 });
-      return res.data?.result?.value?.[0]?.confirmation_status === 'confirmed';
-    } catch { return false; }
+      const res = await this.client.post(
+        'https://mainnet.block-engine.jito.wtf/api/v1/getBundleStatuses',
+        {
+          jsonrpc: "2.0",
+          id: 1,
+          method: "getBundleStatuses",
+          params: [[bundleId]]
+        },
+        { timeout: 8000 }
+      );
+      const status = res.data?.result?.value?.[0]?.confirmation_status;
+      return status === 'confirmed' || status === 'finalized';
+    } catch {
+      return false;
+    }
   }
 
+  // ✅ Direct RPC — returns signature immediately, confirms in background
   private async fallbackToQuickNode(serializedTx: Uint8Array): Promise<{ success: boolean; bundleId?: string; error?: string }> {
     try {
       const rpcUrl = process.env.QUICKNODE_RPC_URL || process.env.SOLANA_RPC_URL;
-      if (!rpcUrl) return { success: false, error: 'No RPC URL' };
-      const res = await this.client.post(rpcUrl, { jsonrpc: "2.0", id: 1, method: "sendTransaction", params: [Buffer.from(serializedTx).toString('base64'), { encoding: "base64", maxRetries: 3, skipPreflight: true }] }, { timeout: 8000 });
-      if (res.data?.result) return { success: true, bundleId: res.data.result };
-      return { success: false, error: res.data?.error?.message };
-    } catch (e: any) { return { success: false, error: 'RPC failure' }; }
+      if (!rpcUrl) return { success: false, error: 'No RPC URL available for fallback' };
+
+      const payload = {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "sendTransaction",
+        params: [
+          Buffer.from(serializedTx).toString('base64'),
+          { encoding: "base64", maxRetries: 3, skipPreflight: true }
+        ]
+      };
+
+      const res = await this.client.post(rpcUrl, payload, { timeout: 8000 });
+
+      if (res.data?.result) {
+        const signature = res.data.result;
+        console.log(`📝 Tx signature: ${signature}`);
+        console.log(`🔍 Check: https://solscan.io/tx/${signature}`);
+
+        // ✅ Confirm in background — scan continues immediately
+        this.confirmTransaction(signature, rpcUrl).then(confirmed => {
+          if (confirmed) console.log(`✅ Tx confirmed on-chain: ${signature}`);
+          else console.log(`⚠️ Tx not confirmed after 50s — check manually: https://solscan.io/tx/${signature}`);
+        });
+
+        // Return success immediately with signature
+        return { success: true, bundleId: signature };
+      }
+
+      return { success: false, error: res.data?.error?.message || 'RPC Rejected' };
+    } catch (e: any) {
+      return { success: false, error: 'Fallback RPC network failure' };
+    }
+  }
+
+  // ✅ Background confirmation — 20 attempts over 50 seconds
+  private async confirmTransaction(signature: string, rpcUrl: string): Promise<boolean> {
+    for (let i = 0; i < 20; i++) {
+      try {
+        await new Promise(resolve => setTimeout(resolve, 2500));
+        const res = await this.client.post(rpcUrl, {
+          jsonrpc: "2.0",
+          id: 1,
+          method: "getSignatureStatuses",
+          params: [[signature], { searchTransactionHistory: true }]
+        }, { timeout: 5000 });
+
+        const status = res.data?.result?.value?.[0];
+        if (status?.confirmationStatus === 'confirmed' ||
+            status?.confirmationStatus === 'finalized') {
+          return true;
+        }
+        if (status?.err) {
+          console.log(`❌ Tx failed on-chain: ${JSON.stringify(status.err)}`);
+          return false;
+        }
+      } catch {
+        // keep polling
+      }
+    }
+    return false;
   }
 }
