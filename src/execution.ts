@@ -41,7 +41,7 @@ export class LowLatencyExecutionEngine {
         inputMint,
         outputMint: targetOutputMint,
         amount: computedUnits,
-        slippageBps: 300,
+        slippageBps: 2000,
         onlyDirectRoutes: true
       },
       timeout: 8000
