@@ -5,7 +5,8 @@ import * as https from 'https';
 
 export class LowLatencyExecutionEngine {
   private jupiterUrl = process.env.QUICKNODE_JUPITER_URL || 'https://quote-api.jup.ag/v6';
-  private jitoBundleEndpoint = 'https://mainnet.block-engine.jito.wtf/api/v1/bundles';
+  // ✅ Updated to Jito's recommended regional endpoint (New York)
+  private jitoBundleEndpoint = 'https://ny.mainnet.block-engine.jito.wtf/api/v1/bundles';
   private wallet: Keypair;
 
   private client = axios.create({
@@ -66,17 +67,14 @@ export class LowLatencyExecutionEngine {
   public async dispatchMevProtectedBundle(tx: VersionedTransaction): Promise<{ success: boolean; bundleId?: string; error?: string }> {
     // Try Jito first
     try {
-            const serializedTx = bs58.encode(tx.serialize());
+      // ✅ Jito officially recommends base64 formatting now
+      const serializedTx = Buffer.from(tx.serialize()).toString('base64');
       const payload = {
         jsonrpc: "2.0",
         id: 1,
         method: "sendBundle",
-        params: [
-          [serializedTx], 
-          { encoding: "base58" }
-        ]
+        params: [[serializedTx]] // Clean array, no encoding tags needed
       };
-
 
       const res = await this.client.post(this.jitoBundleEndpoint, payload, {
         headers: { 'Content-Type': 'application/json' },
@@ -94,7 +92,9 @@ export class LowLatencyExecutionEngine {
         return { success: true, bundleId };
       }
     } catch (e: any) {
-      console.log(`⚠️ Jito failed: ${e.message} — falling back to direct RPC`);
+      // 👇 THIS REVEALS EXACTLY WHY JITO FAILED 👇
+      console.log("🔥 JITO REJECTION REASON:", JSON.stringify(e.response?.data || e.message));
+      console.log(`⚠️ Jito failed — falling back to direct RPC`);
     }
 
     // ✅ Direct RPC fallback — most reliable
@@ -106,7 +106,8 @@ export class LowLatencyExecutionEngine {
     try {
       await new Promise(resolve => setTimeout(resolve, 5000));
       const res = await this.client.post(
-        'https://mainnet.block-engine.jito.wtf/api/v1/getBundleStatuses',
+        // ✅ Updated confirmation endpoint to match New York region
+        'https://ny.mainnet.block-engine.jito.wtf/api/v1/getBundleStatuses',
         {
           jsonrpc: "2.0",
           id: 1,
