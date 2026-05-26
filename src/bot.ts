@@ -49,10 +49,23 @@ interface AlertRecord {
   currentPrice: number;
   lastUpdated: number;
 }
-const alertHistory = new Map<string, AlertRecord>();
+let alertHistory = new Map<string, AlertRecord>();
+
+// Automatically load your previous history when the bot wakes up
+redis.get('bot_history').then((data) => {
+    if (data) {
+        alertHistory = new Map(JSON.parse(data));
+        console.log('✅ History loaded from Redis');
+    }
+});
+
 
 function escapeText(text: string): string {
   return String(text).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+}
+
+async function saveHistory() {
+  await redis.set('bot_history', JSON.stringify(Array.from(alertHistory.entries())));
 }
 
 function getDynamicMode(score: number): string {
@@ -500,6 +513,8 @@ async function scan() {
           currentPrice,
           lastUpdated: Date.now()
         });
+ // This tells the bot to wait until it saves to the Memory Box
+        await saveHistory();
 
         const walletShort = `${executor.getWalletPublicKey().slice(0, 8)}...${executor.getWalletPublicKey().slice(-4)}`;
         const sourceLabel: Record<string, string> = {
