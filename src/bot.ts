@@ -1,4 +1,4 @@
-import { Telegraf } from 'telegraf';
+import { Telegraf, Markup } from 'telegraf';
 import * as dotenv from 'dotenv';
 import axios from 'axios';
 import { OnChainPatternRecognition } from './intelligence';
@@ -19,6 +19,33 @@ const DOMAIN = process.env.RENDER_EXTERNAL_URL || 'https://alpha-discovery-syste
 
 const seenTokens = new Set<string>();
 
+// ✅ PnL position tracker (in-memory)
+interface Position {
+  ticker: string;
+  address: string;
+  entryPrice: number;
+  peakPrice: number;
+  sizeSol: number;
+  entryTime: number;
+}
+const openPositions = new Map<string, Position>();
+
+// ✅ Alert history for /pnl command
+interface AlertRecord {
+  ticker: string;
+  address: string;
+  alertTime: number;
+  alertMcap: number;
+  alertPrice: number;
+  peakMcap: number;
+  peakPrice: number;
+  peakTime: number;
+  currentMcap: number;
+  currentPrice: number;
+  lastUpdated: number;
+}
+const alertHistory = new Map<string, AlertRecord>();
+
 function escapeText(text: string): string {
   return String(text).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
 }
@@ -31,23 +58,18 @@ function getDynamicMode(score: number): string {
 
 function computeAlphaScore(mcap: number, liquidity: number, rugProb: number): number {
   let score = 0;
-
   const ratio = liquidity / mcap;
   if (ratio >= 0.30) score += 40;
   else if (ratio >= 0.20) score += 30;
   else if (ratio >= 0.10) score += 20;
   else if (ratio >= 0.05) score += 10;
-
   if (mcap >= 1000 && mcap <= 70000) score += 25;
-
   if (liquidity >= 25000) score += 20;
   else if (liquidity >= 10000) score += 12;
   else if (liquidity >= 5000) score += 6;
-
   if (rugProb <= 0.10) score += 15;
   else if (rugProb <= 0.20) score += 8;
   else if (rugProb >= 0.30) score -= 10;
-
   return Math.min(100, Math.max(0, score));
 }
 
@@ -60,56 +82,263 @@ function computeRugProbability(mcap: number, liquidity: number): number {
   return 0.12;
 }
 
+// ✅ Detect momentum reversal pattern from pair data
+function isReversalCandidate(pair: any): boolean {
+  const h24 = parseFloat(pair.priceChange?.h24 || '0');
+  const h6 = parseFloat(pair.priceChange?.h6 || '0');
+  const h1 = parseFloat(pair.priceChange?.h1 || '0');
+  const volH24 = parseFloat(pair.volume?.h24 || '0');
+  const volH6 = parseFloat(pair.volume?.h6 || '0');
+
+  // Dumped hard in 24hrs but recovering in last 1-6hrs
+  const dumpedHard = h24 <= -40;
+  const recoveringH1 = h1 >= 5;
+  const recoveringH6 = h6 >= 10;
+  const volumeReturning = volH6 > 0 && volH24 > 0 && (volH6 / volH24) > 0.3;
+
+  return dumpedHard && (recoveringH1 || recoveringH6) && volumeReturning;
+}
+
+// ✅ PnL + alert history monitor — runs every 2 minutes
+async function monitorPositions() {
+  const allAddresses = new Set([
+    ...openPositions.keys(),
+    ...alertHistory.keys()
+  ]);
+
+  if (allAddresses.size === 0) return;
+  console.log(`📊 Monitoring ${allAddresses.size} token(s)...`);
+
+  for (const address of allAddresses) {
+    try {
+      const { data } = await axios.get(
+        `https://api.dexscreener.com/latest/dex/tokens/${address}`,
+        { timeout: 8000 }
+      );
+      const pair = data?.pairs?.[0];
+      if (!pair) continue;
+
+      const currentPrice = parseFloat(pair.priceUsd || '0');
+      const currentMcap = parseFloat(pair.fdv || pair.marketCap || '0');
+      if (!currentPrice) continue;
+
+      // ✅ Update alert history peaks
+      if (alertHistory.has(address)) {
+        const rec = alertHistory.get(address)!;
+        const updatedRec = { ...rec, currentPrice, currentMcap, lastUpdated: Date.now() };
+        if (currentPrice > rec.peakPrice) {
+          updatedRec.peakPrice = currentPrice;
+          updatedRec.peakMcap = currentMcap;
+          updatedRec.peakTime = Date.now();
+        }
+        alertHistory.set(address, updatedRec);
+      }
+
+      // ✅ Update open position peaks + check exit conditions
+      if (openPositions.has(address)) {
+        const pos = openPositions.get(address)!;
+        if (currentPrice > pos.peakPrice) {
+          openPositions.set(address, { ...pos, peakPrice: currentPrice });
+        }
+
+        const pnlPct = ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
+        const dropFromPeak = ((currentPrice - pos.peakPrice) / pos.peakPrice) * 100;
+        const holdingMins = Math.floor((Date.now() - pos.entryTime) / 60000);
+
+        let exitReason = '';
+        if (pnlPct >= 100) exitReason = '🎯 TAKE PROFIT — 2x Hit';
+        else if (pnlPct <= -30) exitReason = '🛑 STOP LOSS — \\-30% Hit';
+        else if (pos.peakPrice > pos.entryPrice * 1.3 && dropFromPeak <= -20) {
+          exitReason = '📉 TRAILING STOP — 20% Drop From Peak';
+        }
+
+        if (exitReason) {
+          const pnlSol = (pos.sizeSol * pnlPct) / 100;
+          const msg = [
+            `💰 *POSITION CLOSED*`,
+            ``,
+            `*Token:* $${escapeText(pos.ticker)}`,
+            `*Address:* \`${address}\``,
+            ``,
+            `*Entry Price:* $${pos.entryPrice.toFixed(8)}`,
+            `*Exit Price:* $${currentPrice.toFixed(8)}`,
+            `*PnL:* ${pnlPct >= 0 ? '🟢' : '🔴'} ${pnlPct.toFixed(2)}%`,
+            `*PnL in SOL:* ${pnlSol >= 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL`,
+            `*Size:* ${pos.sizeSol} SOL`,
+            `*Held:* ${holdingMins} minutes`,
+            ``,
+            exitReason,
+          ].join('\n');
+          await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
+          openPositions.delete(address);
+          console.log(`✅ Position closed: ${pos.ticker} ${pnlPct.toFixed(1)}%`);
+        }
+      }
+    } catch (err: any) {
+      console.log(`❌ Monitor error: ${err.message}`);
+    }
+  }
+}
+
 async function scan() {
-  console.log("🔍 Scanning pump.fun tokens...");
+  console.log("🔍 Scanning pump.fun + PumpSwap + Early Detection + Reversals...");
   try {
-    // ✅ Keep reliable profiles endpoint but pre-filter to pump.fun only
-    const { data: profiles } = await axios.get(
+
+    // ── SOURCE 1: DexScreener profiles ──
+    const profilesRes = await axios.get(
       'https://api.dexscreener.com/token-profiles/latest/v1',
       { timeout: 10000 }
     );
+    const profiles = profilesRes.data || [];
+    const pumpProfiles = profiles
+      .filter((p: any) => typeof p.tokenAddress === 'string' && p.tokenAddress.endsWith('pump'))
+      .map((p: any) => ({ tokenAddress: p.tokenAddress, source: 'profiles' }));
 
-    // ✅ Filter to pump.fun tokens only — all pump.fun addresses end in 'pump'
-    const pumpProfiles = (profiles || []).filter(
-      (p: any) => typeof p.tokenAddress === 'string' && p.tokenAddress.endsWith('pump')
-    );
+    // ── SOURCE 2: PumpSwap pairs ──
+    let pumpSwapProfiles: any[] = [];
+    try {
+      const pumpSwapRes = await axios.get(
+        'https://api.dexscreener.com/latest/dex/pairs/solana/pumpfun',
+        { timeout: 10000 }
+      );
+      const pumpSwapPairs = pumpSwapRes.data?.pairs || [];
+      pumpSwapProfiles = pumpSwapPairs
+        .filter((p: any) => p.baseToken?.address && p.chainId === 'solana')
+        .map((p: any) => ({
+          tokenAddress: p.baseToken.address,
+          source: 'pumpswap',
+          cachedPair: p
+        }));
+      console.log(`PumpSwap: ${pumpSwapProfiles.length} pairs`);
+    } catch (psErr: any) {
+      console.log(`⚠️ PumpSwap fetch failed: ${psErr.message}`);
+    }
 
-    console.log(`Found ${profiles.length} profiles. ${pumpProfiles.length} are pump.fun. Checking up to 20...`);
+    // ── SOURCE 3: pump.fun newest tokens ──
+    let newPumpTokens: any[] = [];
+    try {
+      const newRes = await axios.get(
+        'https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false',
+        { timeout: 10000 }
+      );
+      const coins = newRes.data || [];
+      newPumpTokens = coins
+        .filter((c: any) => c.mint && typeof c.mint === 'string')
+        .map((c: any) => ({
+          tokenAddress: c.mint,
+          source: 'pumpfun-new',
+          cachedMcap: c.usd_market_cap || 0,
+          cachedName: c.symbol || 'UNKNOWN',
+          createdAt: c.created_timestamp || 0
+        }));
+      console.log(`Pump.fun new: ${newPumpTokens.length} tokens`);
+    } catch (nErr: any) {
+      console.log(`⚠️ Pump.fun new tokens failed: ${nErr.message}`);
+    }
 
-    for (const p of pumpProfiles.slice(0, 20)) {
+    // ── SOURCE 4: DexScreener new pairs (last 2hrs) ──
+    let newDexPairs: any[] = [];
+    try {
+      const newPairsRes = await axios.get(
+        'https://api.dexscreener.com/latest/dex/search?q=pump.fun&chainIds=solana',
+        { timeout: 10000 }
+      );
+      const pairs = newPairsRes.data?.pairs || [];
+      newDexPairs = pairs
+        .filter((p: any) =>
+          p.baseToken?.address?.endsWith('pump') &&
+          p.chainId === 'solana' &&
+          p.pairCreatedAt && (Date.now() - p.pairCreatedAt) < 2 * 60 * 60 * 1000
+        )
+        .map((p: any) => ({
+          tokenAddress: p.baseToken.address,
+          source: 'dex-new',
+          cachedPair: p
+        }));
+      console.log(`New DEX pairs: ${newDexPairs.length} (last 2hrs)`);
+    } catch (dErr: any) {
+      console.log(`⚠️ New DEX pairs failed: ${dErr.message}`);
+    }
+
+    // ── SOURCE 5: Momentum reversals (NEW — pumped, retraced, building again) ──
+    let reversalTokens: any[] = [];
+    try {
+      const reversalRes = await axios.get(
+        'https://api.dexscreener.com/latest/dex/search?q=solana&chainIds=solana',
+        { timeout: 10000 }
+      );
+      const allPairs = reversalRes.data?.pairs || [];
+      reversalTokens = allPairs
+        .filter((p: any) =>
+          p.baseToken?.address?.endsWith('pump') &&
+          p.chainId === 'solana' &&
+          isReversalCandidate(p) &&
+          parseFloat(p.fdv || p.marketCap || '0') >= 1000 &&
+          parseFloat(p.fdv || p.marketCap || '0') <= 70000
+        )
+        .map((p: any) => ({
+          tokenAddress: p.baseToken.address,
+          source: 'reversal',
+          cachedPair: p
+        }));
+      console.log(`Reversal candidates: ${reversalTokens.length}`);
+    } catch (rErr: any) {
+      console.log(`⚠️ Reversal scan failed: ${rErr.message}`);
+    }
+
+    // ── MERGE + DEDUPLICATE all 5 sources ──
+    const localSeen = new Set<string>();
+    const allCandidates: any[] = [];
+
+    // Priority: new tokens first, then reversals, then established
+    for (const p of [...newPumpTokens, ...newDexPairs, ...reversalTokens, ...pumpSwapProfiles, ...pumpProfiles]) {
+      if (!localSeen.has(p.tokenAddress)) {
+        localSeen.add(p.tokenAddress);
+        allCandidates.push(p);
+      }
+    }
+
+    console.log(`Total candidates: ${allCandidates.length} across 5 sources`);
+
+    for (const p of allCandidates.slice(0, 40)) {
       try {
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        await new Promise(resolve => setTimeout(resolve, 800));
 
-        if (seenTokens.has(p.tokenAddress)) {
-          console.log(`⏭ Already seen: ${p.tokenAddress}`);
-          continue;
-        }
+        if (seenTokens.has(p.tokenAddress)) continue;
 
-        const { data } = await axios.get(
-          `https://api.dexscreener.com/latest/dex/tokens/${p.tokenAddress}`,
-          { timeout: 8000 }
-        );
-
-        const pair = data?.pairs?.[0];
+        let pair = p.cachedPair || null;
         if (!pair) {
-          seenTokens.add(p.tokenAddress);
-          continue;
+          try {
+            const { data } = await axios.get(
+              `https://api.dexscreener.com/latest/dex/tokens/${p.tokenAddress}`,
+              { timeout: 8000 }
+            );
+            pair = data?.pairs?.[0];
+          } catch {
+            seenTokens.add(p.tokenAddress);
+            continue;
+          }
         }
 
-        const mcap = parseFloat(pair.fdv || pair.marketCap || '0');
-        const liquidity = parseFloat(pair.liquidity?.usd || '0');
-        const ticker = pair.baseToken.symbol;
-        const address = pair.baseToken.address;
-        const creatorAddress = pair.info?.deployer || undefined;
+        let mcap = pair
+          ? parseFloat(pair.fdv || pair.marketCap || '0')
+          : (p.cachedMcap || 0);
+        let liquidity = pair
+          ? parseFloat(pair.liquidity?.usd || '0')
+          : 0;
+        const ticker = pair?.baseToken?.symbol || p.cachedName || 'UNKNOWN';
+        const address = pair?.baseToken?.address || p.tokenAddress;
+        const creatorAddress = pair?.info?.deployer || undefined;
+        const currentPrice = parseFloat(pair?.priceUsd || '0');
 
-        if (!mcap || !liquidity) {
-          seenTokens.add(p.tokenAddress);
-          continue;
-        }
+        if (!liquidity && mcap > 0) liquidity = mcap * 0.15;
+        if (!mcap) { seenTokens.add(p.tokenAddress); continue; }
 
-        // ✅ Hard MCAP filter: $1k–$70k only
-        if (mcap < 1000 || mcap > 70000) {
-          console.log(`⏭ MCAP $${mcap.toLocaleString()} out of range — skipping ${ticker}`);
+        const isNew = p.source === 'pumpfun-new' || p.source === 'dex-new';
+        const isReversal = p.source === 'reversal';
+        const mcapMin = isNew ? 500 : 1000;
+
+        if (mcap < mcapMin || mcap > 70000) {
           seenTokens.add(p.tokenAddress);
           continue;
         }
@@ -117,11 +346,12 @@ async function scan() {
         const rugProb = computeRugProbability(mcap, liquidity);
         const alphaScore = computeAlphaScore(mcap, liquidity, rugProb);
 
-        console.log(`Checking ${ticker}: MCAP $${mcap} | Liq $${liquidity} | Score ${alphaScore}/100`);
+        // Reversals get same threshold — precision must not drop
+        const scoreMin = isNew ? 75 : 85;
 
-        // ✅ Score gate: 85+
-        if (alphaScore < 85) {
-          console.log(`⏭ Score ${alphaScore}/100 — below 85, skipping ${ticker}`);
+        console.log(`[${p.source}] ${ticker}: MCAP $${mcap} | Liq $${liquidity} | Score ${alphaScore}/100`);
+
+        if (alphaScore < scoreMin) {
           seenTokens.add(p.tokenAddress);
           continue;
         }
@@ -141,24 +371,43 @@ async function scan() {
         ]);
 
         if (!pattern.passedPatterns) {
-          console.log(`⏭ ${ticker} failed intelligence gate: ${pattern.reason}`);
+          console.log(`⏭ ${ticker} failed: ${pattern.reason}`);
           seenTokens.add(p.tokenAddress);
           continue;
         }
 
+        // ✅ Extra reversal context for alert
+        const h24 = pair ? parseFloat(pair.priceChange?.h24 || '0') : 0;
+        const h1 = pair ? parseFloat(pair.priceChange?.h1 || '0') : 0;
+
         let executionState = '';
+        let executedSizeSol = 0;
+        let executedPrice = 0;
+
         if (risk.allow) {
           try {
             const tx = await executor.buildJupiterSwapTransaction(address, risk.sizeSol, 'BUY');
             tx.sign([executor.getWalletKeypair()]);
             const result = await executor.dispatchMevProtectedBundle(tx);
-            executionState = result.success
-              ? `✅ Auto\\-Buy Executed`
-              : `❌ Auto\\-Buy Failed: ${escapeText(result.error || '')}`;
+            if (result.success) {
+              executionState = `✅ Auto\\-Buy Executed`;
+              executedSizeSol = risk.sizeSol;
+              executedPrice = currentPrice;
+              if (executedPrice > 0) {
+                openPositions.set(address, {
+                  ticker, address,
+                  entryPrice: executedPrice,
+                  peakPrice: executedPrice,
+                  sizeSol: executedSizeSol,
+                  entryTime: Date.now()
+                });
+                console.log(`📌 Position opened: ${ticker} @ $${executedPrice}`);
+              }
+            } else {
+              executionState = `❌ Auto\\-Buy Failed: ${escapeText(result.error || '')}`;
+            }
           } catch (execErr: any) {
-            const isNetworkErr =
-              execErr.message?.includes('ENOTFOUND') ||
-              execErr.message?.includes('ECONNREFUSED');
+            const isNetworkErr = execErr.message?.includes('ENOTFOUND') || execErr.message?.includes('ECONNREFUSED');
             executionState = isNetworkErr
               ? `⏸ Execution Paused: Jupiter unreachable on free tier`
               : `❌ Execution Blocked: ${escapeText(execErr.message)}`;
@@ -167,7 +416,32 @@ async function scan() {
           executionState = `❌ Auto\\-Buy Blocked: ${escapeText(risk.reason || '')}`;
         }
 
+        // ✅ Record in alert history for /pnl
+        alertHistory.set(address, {
+          ticker, address,
+          alertTime: Date.now(),
+          alertMcap: mcap,
+          alertPrice: currentPrice,
+          peakMcap: mcap,
+          peakPrice: currentPrice,
+          peakTime: Date.now(),
+          currentMcap: mcap,
+          currentPrice,
+          lastUpdated: Date.now()
+        });
+
         const walletShort = `${executor.getWalletPublicKey().slice(0, 8)}...${executor.getWalletPublicKey().slice(-4)}`;
+        const sourceLabel: Record<string, string> = {
+          'pumpfun-new': '🆕 Pump\\.fun \\(Just Launched\\)',
+          'dex-new': '⚡ New DEX Pair',
+          'pumpswap': '🔄 PumpSwap',
+          'profiles': '📈 Trending',
+          'reversal': '🔄 Reversal \\(Retraced & Building\\)'
+        };
+
+        const reversalLine = isReversal
+          ? [``, `📉 *Reversal Signal:* 24h: ${h24.toFixed(1)}% | 1h: +${h1.toFixed(1)}% recovering`]
+          : [];
 
         const msg = [
           `🚨🚨 *AUTONOMOUS AI DEGEN CALL* 🚨🚨`,
@@ -176,6 +450,8 @@ async function scan() {
           `*Address:* \`${address}\``,
           `*Market Cap:* 💰 $${mcap.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
           `*Liquidity:* $${liquidity.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
+          `*Source:* ${sourceLabel[p.source] || '📈 Trending'}`,
+          ...reversalLine,
           ``,
           `🤖 *Execution State:*`,
           executionState,
@@ -200,7 +476,7 @@ async function scan() {
         ].join('\n');
 
         await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
-        console.log(`✅ Alert sent for ${ticker} — Score: ${alphaScore}/100`);
+        console.log(`✅ Alert sent: ${ticker} — Score: ${alphaScore}/100 — Source: ${p.source}`);
 
         seenTokens.add(p.tokenAddress);
         if (seenTokens.size > 500) seenTokens.clear();
@@ -220,15 +496,12 @@ bot.launch({
   console.log(`🤖 Bot Live via Webhook on port ${PORT}`);
   scan();
   setInterval(scan, 60000);
-
-  // ✅ Self-ping every 5 minutes to prevent Render free tier spin-down
+  setInterval(monitorPositions, 2 * 60 * 1000);
   setInterval(async () => {
     try {
       await axios.get(DOMAIN, { timeout: 5000 });
-      console.log('🏓 Self-ping sent — keeping instance alive');
-    } catch {
-      // ignore ping errors
-    }
+      console.log('🏓 Self-ping sent');
+    } catch {}
   }, 5 * 60 * 1000);
 
 }).catch((err) => {
@@ -236,7 +509,105 @@ bot.launch({
   process.exit(1);
 });
 
-bot.command('test', (ctx) => ctx.reply('✅ Bot online. Scanning pump.fun lowcaps — 85+/100, $1k–$70k mcap.'));
+bot.command('test', (ctx) => ctx.reply('✅ Bot online. Scanning pump.fun + PumpSwap + Early Detection + Reversals.'));
+
+bot.command('positions', async (ctx) => {
+  if (openPositions.size === 0) return ctx.reply('📭 No open positions.');
+  const lines = ['📊 *Open Positions:*', ''];
+  for (const [address, pos] of openPositions.entries()) {
+    const mins = Math.floor((Date.now() - pos.entryTime) / 60000);
+    lines.push(`• $${escapeText(pos.ticker)} — ${pos.sizeSol} SOL — ${mins}m held`);
+    lines.push(`  Entry: $${pos.entryPrice.toFixed(8)}`);
+    lines.push(`  Peak: $${pos.peakPrice.toFixed(8)}`);
+    lines.push('');
+  }
+  ctx.reply(lines.join('\n'), { parse_mode: 'Markdown' });
+});
+
+// ✅ /pnl command — inline keyboard of alerted tokens
+bot.command('pnl', async (ctx) => {
+  if (alertHistory.size === 0) {
+    return ctx.reply('📭 No alerts recorded yet. Wait for the bot to call some tokens.');
+  }
+
+  const buttons = Array.from(alertHistory.entries())
+    .sort((a, b) => b[1].alertTime - a[1].alertTime)
+    .slice(0, 20)
+    .map(([address, rec]) => {
+      const pnlPct = rec.peakPrice > rec.alertPrice
+        ? (((rec.peakPrice - rec.alertPrice) / rec.alertPrice) * 100).toFixed(1)
+        : '0';
+      const label = `$${rec.ticker} | Peak: +${pnlPct}%`;
+      return [Markup.button.callback(label, `pnl_${address}`)];
+    });
+
+  await ctx.reply(
+    '📊 *Select a token to see its PnL since alert:*',
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard(buttons)
+    }
+  );
+});
+
+// ✅ Handle /pnl token selection
+bot.action(/^pnl_(.+)$/, async (ctx) => {
+  const address = ctx.match[1];
+  const rec = alertHistory.get(address);
+
+  if (!rec) {
+    return ctx.answerCbQuery('Token not found in history.');
+  }
+
+  await ctx.answerCbQuery();
+
+  const alertDate = new Date(rec.alertTime).toUTCString();
+  const peakDate = new Date(rec.peakTime).toUTCString();
+  const peakPnlPct = rec.peakPrice > 0 && rec.alertPrice > 0
+    ? ((rec.peakPrice - rec.alertPrice) / rec.alertPrice) * 100
+    : 0;
+  const currentPnlPct = rec.currentPrice > 0 && rec.alertPrice > 0
+    ? ((rec.currentPrice - rec.alertPrice) / rec.alertPrice) * 100
+    : 0;
+  const peakMcapGain = rec.alertMcap > 0
+    ? ((rec.peakMcap - rec.alertMcap) / rec.alertMcap) * 100
+    : 0;
+
+  const neverPumped = rec.peakPrice <= rec.alertPrice;
+
+  const lines = [
+    `📊 *PnL Report: $${escapeText(rec.ticker)}*`,
+    ``,
+    `*Address:* \`${address}\``,
+    `*Alerted:* ${escapeText(alertDate)}`,
+    ``,
+    `*MCAP at Alert:* $${rec.alertMcap.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
+    `*Price at Alert:* $${rec.alertPrice.toFixed(8)}`,
+    ``,
+  ];
+
+  if (neverPumped) {
+    lines.push(`❌ *Did not pump above alert price*`);
+    lines.push(`*Current Price:* $${rec.currentPrice.toFixed(8)}`);
+    lines.push(`*Current PnL:* 🔴 ${currentPnlPct.toFixed(2)}%`);
+  } else {
+    lines.push(`🚀 *Peak Performance:*`);
+    lines.push(`• Peak Price: $${rec.peakPrice.toFixed(8)}`);
+    lines.push(`• Peak MCAP: $${rec.peakMcap.toLocaleString('en-US', { maximumFractionDigits: 0 })}`);
+    lines.push(`• Peak Gain: 🟢 +${peakPnlPct.toFixed(2)}%`);
+    lines.push(`• MCAP Gain: +${peakMcapGain.toFixed(1)}%`);
+    lines.push(`• Peak Time: ${escapeText(peakDate)}`);
+    lines.push(``);
+    lines.push(`📍 *Current:*`);
+    lines.push(`• Price: $${rec.currentPrice.toFixed(8)}`);
+    lines.push(`• PnL vs Alert: ${currentPnlPct >= 0 ? '🟢 +' : '🔴 '}${currentPnlPct.toFixed(2)}%`);
+  }
+
+  lines.push(``);
+  lines.push(`📱 [Monitor Chart Live](https://dexscreener.com/solana/${address})`);
+
+  await ctx.reply(lines.join('\n'), { parse_mode: 'Markdown' });
+});
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
