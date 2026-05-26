@@ -54,7 +54,7 @@ export class LowLatencyExecutionEngine {
       wrapAndUnwrapSol: true,
       prioritizationFeeLamports: {
         priorityLevelWithMaxLamports: {
-          maxLamports: 5000000,
+          maxLamports: 3000000,
           priorityLevel: "veryHigh"
         }
       }
