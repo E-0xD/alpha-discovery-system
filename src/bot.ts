@@ -81,7 +81,7 @@ function computeAlphaScore(mcap: number, liquidity: number, rugProb: number): nu
   else if (ratio >= 0.20) score += 30;
   else if (ratio >= 0.10) score += 20;
   else if (ratio >= 0.05) score += 10;
-  if (mcap >= 1000 && mcap <= 70000) score += 25;
+  if (mcap >= 1000 && mcap <= 40000) score += 25;
   if (liquidity >= 25000) score += 20;
   else if (liquidity >= 10000) score += 12;
   else if (liquidity >= 5000) score += 6;
@@ -359,7 +359,7 @@ async function scan() {
           p.chainId === 'solana' &&
           isReversalCandidate(p) &&
           parseFloat(p.fdv || p.marketCap || '0') >= 1000 &&
-          parseFloat(p.fdv || p.marketCap || '0') <= 70000
+          parseFloat(p.fdv || p.marketCap || '0') <= 40000
         )
         .map((p: any) => ({
           tokenAddress: p.baseToken.address,
@@ -422,7 +422,7 @@ async function scan() {
         const isReversal = p.source === 'reversal';
         const mcapMin = isNew ? 500 : 1000;
 
-        if (mcap < mcapMin || mcap > 70000) {
+        if (mcap < mcapMin || mcap > 40000) {
           seenTokens.add(p.tokenAddress);
           continue;
         }
@@ -491,12 +491,16 @@ async function scan() {
             } else {
               executionState = `❌ Auto\\-Buy Failed: ${escapeText(result.error || '')}`;
             }
-          } catch (execErr: any) {
+                    } catch (execErr: any) {
+            // 👇 THIS LINE REVEALS THE EXACT JUPITER ERROR IN YOUR RENDER LOGS 👇
+            console.log("🔥 AUTO-BUY REJECTION REASON:", JSON.stringify(execErr.response?.data || execErr.message));
+
             const isNetworkErr = execErr.message?.includes('ENOTFOUND') || execErr.message?.includes('ECONNREFUSED');
             executionState = isNetworkErr
               ? `⏸ Execution Paused: Jupiter unreachable on free tier`
               : `❌ Execution Blocked: ${escapeText(execErr.message)}`;
           }
+
         } else {
           executionState = `❌ Auto\\-Buy Blocked: ${escapeText(risk.reason || '')}`;
         }
