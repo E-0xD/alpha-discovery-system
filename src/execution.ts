@@ -4,9 +4,7 @@ import bs58 from 'bs58';
 import * as https from 'https';
 
 export class LowLatencyExecutionEngine {
-  private jupiterUrl = process.env.QUICKNODE_RPC_URL
-    ? `${process.env.QUICKNODE_RPC_URL}addon/200/v6`
-    : 'https://quote-api.jup.ag/v6';
+  private jupiterUrl = process.env.QUICKNODE_JUPITER_URL || 'https://quote-api.jup.ag/v6';
   private jitoBundleEndpoint = 'https://mainnet.block-engine.jito.wtf/api/v1/bundles';
   private wallet: Keypair;
 
