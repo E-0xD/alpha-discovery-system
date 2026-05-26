@@ -19,7 +19,6 @@ const DOMAIN = process.env.RENDER_EXTERNAL_URL || 'https://alpha-discovery-syste
 
 const seenTokens = new Set<string>();
 
-// ✅ PnL position tracker (in-memory)
 interface Position {
   ticker: string;
   address: string;
@@ -30,7 +29,6 @@ interface Position {
 }
 const openPositions = new Map<string, Position>();
 
-// ✅ Alert history for /pnl command
 interface AlertRecord {
   ticker: string;
   address: string;
@@ -82,73 +80,126 @@ function computeRugProbability(mcap: number, liquidity: number): number {
   return 0.12;
 }
 
-// ✅ Detect momentum reversal pattern from pair data
 function isReversalCandidate(pair: any): boolean {
   const h24 = parseFloat(pair.priceChange?.h24 || '0');
   const h6 = parseFloat(pair.priceChange?.h6 || '0');
   const h1 = parseFloat(pair.priceChange?.h1 || '0');
   const volH24 = parseFloat(pair.volume?.h24 || '0');
   const volH6 = parseFloat(pair.volume?.h6 || '0');
-
-  // Dumped hard in 24hrs but recovering in last 1-6hrs
   const dumpedHard = h24 <= -40;
   const recoveringH1 = h1 >= 5;
   const recoveringH6 = h6 >= 10;
   const volumeReturning = volH6 > 0 && volH24 > 0 && (volH6 / volH24) > 0.3;
-
   return dumpedHard && (recoveringH1 || recoveringH6) && volumeReturning;
 }
 
-// ✅ PnL + alert history monitor — runs every 2 minutes
+// ✅ UPGRADED: Multi-source live price — Jupiter first, pump.fun second, DexScreener fallback
+async function getLivePrice(address: string): Promise<{ price: number; mcap: number }> {
+
+  // Source 1: Jupiter Price API v2 — reads directly from on-chain pools, ~1-2s fresh
+  try {
+    const jupRes = await axios.get(
+      `https://api.jup.ag/price/v2?ids=${address}`,
+      { timeout: 4000 }
+    );
+    const jupPrice = parseFloat(jupRes.data?.data?.[address]?.price || '0');
+    if (jupPrice > 0) {
+      // Jupiter doesn't return mcap so fetch that separately from pump.fun
+      try {
+        const pumpRes = await axios.get(
+          `https://frontend-api.pump.fun/coins/${address}`,
+          { timeout: 3000 }
+        );
+        const mcap = parseFloat(pumpRes.data?.usd_market_cap || '0');
+        return { price: jupPrice, mcap };
+      } catch {
+        return { price: jupPrice, mcap: 0 };
+      }
+    }
+  } catch {}
+
+  // Source 2: Pump.fun frontend API — often more current than DexScreener for pump tokens
+  try {
+    const pumpRes = await axios.get(
+      `https://frontend-api.pump.fun/coins/${address}`,
+      { timeout: 4000 }
+    );
+    const price = parseFloat(pumpRes.data?.price || pumpRes.data?.sol_price || '0');
+    const mcap = parseFloat(pumpRes.data?.usd_market_cap || '0');
+    if (price > 0) return { price, mcap };
+  } catch {}
+
+  // Source 3: DexScreener — fallback only
+  try {
+    const dexRes = await axios.get(
+      `https://api.dexscreener.com/latest/dex/tokens/${address}`,
+      { timeout: 5000 }
+    );
+    const pair = dexRes.data?.pairs?.[0];
+    const price = parseFloat(pair?.priceUsd || '0');
+    const mcap = parseFloat(pair?.fdv || pair?.marketCap || '0');
+    if (price > 0) return { price, mcap };
+  } catch {}
+
+  return { price: 0, mcap: 0 };
+}
+
+// ✅ UPGRADED: 30 second polling, parallel fetches, multi-source prices
 async function monitorPositions() {
+  const now = Date.now();
+  const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
+
+  const recentAlerts = [...alertHistory.keys()].filter(addr => {
+    const rec = alertHistory.get(addr);
+    return rec && (now - rec.alertTime) < TWENTY_FOUR_HOURS;
+  });
+
   const allAddresses = new Set([
     ...openPositions.keys(),
-    ...alertHistory.keys()
+    ...recentAlerts
   ]);
 
   if (allAddresses.size === 0) return;
-  console.log(`📊 Monitoring ${allAddresses.size} token(s)...`);
 
-  for (const address of allAddresses) {
+  // Fetch all prices in parallel — no waiting one by one
+  await Promise.all(Array.from(allAddresses).map(async (address) => {
     try {
-      const { data } = await axios.get(
-        `https://api.dexscreener.com/latest/dex/tokens/${address}`,
-        { timeout: 8000 }
-      );
-      const pair = data?.pairs?.[0];
-      if (!pair) continue;
+      const { price: currentPrice, mcap: currentMcap } = await getLivePrice(address);
+      if (!currentPrice) return;
 
-      const currentPrice = parseFloat(pair.priceUsd || '0');
-      const currentMcap = parseFloat(pair.fdv || pair.marketCap || '0');
-      if (!currentPrice) continue;
-
-      // ✅ Update alert history peaks
+      // Update alert history
       if (alertHistory.has(address)) {
         const rec = alertHistory.get(address)!;
-        const updatedRec = { ...rec, currentPrice, currentMcap, lastUpdated: Date.now() };
+        const updated: AlertRecord = {
+          ...rec,
+          currentPrice,
+          currentMcap,
+          lastUpdated: now
+        };
         if (currentPrice > rec.peakPrice) {
-          updatedRec.peakPrice = currentPrice;
-          updatedRec.peakMcap = currentMcap;
-          updatedRec.peakTime = Date.now();
+          updated.peakPrice = currentPrice;
+          updated.peakMcap = currentMcap;
+          updated.peakTime = now;
+          console.log(`📈 New peak ${rec.ticker}: $${currentPrice.toFixed(8)} (+${(((currentPrice - rec.alertPrice) / rec.alertPrice) * 100).toFixed(1)}%)`);
         }
-        alertHistory.set(address, updatedRec);
+        alertHistory.set(address, updated);
       }
 
-      // ✅ Update open position peaks + check exit conditions
+      // Update open positions + check exit
       if (openPositions.has(address)) {
         const pos = openPositions.get(address)!;
-        if (currentPrice > pos.peakPrice) {
-          openPositions.set(address, { ...pos, peakPrice: currentPrice });
-        }
+        const updated = { ...pos };
+        if (currentPrice > pos.peakPrice) updated.peakPrice = currentPrice;
+        openPositions.set(address, updated);
 
         const pnlPct = ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
-        const dropFromPeak = ((currentPrice - pos.peakPrice) / pos.peakPrice) * 100;
-        const holdingMins = Math.floor((Date.now() - pos.entryTime) / 60000);
+        const dropFromPeak = ((currentPrice - updated.peakPrice) / updated.peakPrice) * 100;
+        const holdingMins = Math.floor((now - pos.entryTime) / 60000);
 
         let exitReason = '';
         if (pnlPct >= 100) exitReason = '🎯 TAKE PROFIT — 2x Hit';
         else if (pnlPct <= -30) exitReason = '🛑 STOP LOSS — \\-30% Hit';
-        else if (pos.peakPrice > pos.entryPrice * 1.3 && dropFromPeak <= -20) {
+        else if (updated.peakPrice > pos.entryPrice * 1.3 && dropFromPeak <= -20) {
           exitReason = '📉 TRAILING STOP — 20% Drop From Peak';
         }
 
@@ -171,13 +222,13 @@ async function monitorPositions() {
           ].join('\n');
           await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
           openPositions.delete(address);
-          console.log(`✅ Position closed: ${pos.ticker} ${pnlPct.toFixed(1)}%`);
+          console.log(`✅ Closed: ${pos.ticker} ${pnlPct.toFixed(1)}%`);
         }
       }
     } catch (err: any) {
-      console.log(`❌ Monitor error: ${err.message}`);
+      console.log(`❌ Monitor error ${address}: ${err.message}`);
     }
-  }
+  }));
 }
 
 async function scan() {
@@ -211,7 +262,7 @@ async function scan() {
         }));
       console.log(`PumpSwap: ${pumpSwapProfiles.length} pairs`);
     } catch (psErr: any) {
-      console.log(`⚠️ PumpSwap fetch failed: ${psErr.message}`);
+      console.log(`⚠️ PumpSwap failed: ${psErr.message}`);
     }
 
     // ── SOURCE 3: pump.fun newest tokens ──
@@ -233,7 +284,7 @@ async function scan() {
         }));
       console.log(`Pump.fun new: ${newPumpTokens.length} tokens`);
     } catch (nErr: any) {
-      console.log(`⚠️ Pump.fun new tokens failed: ${nErr.message}`);
+      console.log(`⚠️ Pump.fun new failed: ${nErr.message}`);
     }
 
     // ── SOURCE 4: DexScreener new pairs (last 2hrs) ──
@@ -260,7 +311,7 @@ async function scan() {
       console.log(`⚠️ New DEX pairs failed: ${dErr.message}`);
     }
 
-    // ── SOURCE 5: Momentum reversals (NEW — pumped, retraced, building again) ──
+    // ── SOURCE 5: Momentum reversals ──
     let reversalTokens: any[] = [];
     try {
       const reversalRes = await axios.get(
@@ -281,7 +332,7 @@ async function scan() {
           source: 'reversal',
           cachedPair: p
         }));
-      console.log(`Reversal candidates: ${reversalTokens.length}`);
+      console.log(`Reversals: ${reversalTokens.length}`);
     } catch (rErr: any) {
       console.log(`⚠️ Reversal scan failed: ${rErr.message}`);
     }
@@ -290,7 +341,6 @@ async function scan() {
     const localSeen = new Set<string>();
     const allCandidates: any[] = [];
 
-    // Priority: new tokens first, then reversals, then established
     for (const p of [...newPumpTokens, ...newDexPairs, ...reversalTokens, ...pumpSwapProfiles, ...pumpProfiles]) {
       if (!localSeen.has(p.tokenAddress)) {
         localSeen.add(p.tokenAddress);
@@ -345,8 +395,6 @@ async function scan() {
 
         const rugProb = computeRugProbability(mcap, liquidity);
         const alphaScore = computeAlphaScore(mcap, liquidity, rugProb);
-
-        // Reversals get same threshold — precision must not drop
         const scoreMin = isNew ? 75 : 85;
 
         console.log(`[${p.source}] ${ticker}: MCAP $${mcap} | Liq $${liquidity} | Score ${alphaScore}/100`);
@@ -376,7 +424,6 @@ async function scan() {
           continue;
         }
 
-        // ✅ Extra reversal context for alert
         const h24 = pair ? parseFloat(pair.priceChange?.h24 || '0') : 0;
         const h1 = pair ? parseFloat(pair.priceChange?.h1 || '0') : 0;
 
@@ -416,7 +463,7 @@ async function scan() {
           executionState = `❌ Auto\\-Buy Blocked: ${escapeText(risk.reason || '')}`;
         }
 
-        // ✅ Record in alert history for /pnl
+        // Record in alert history for /pnl
         alertHistory.set(address, {
           ticker, address,
           alertTime: Date.now(),
@@ -496,7 +543,11 @@ bot.launch({
   console.log(`🤖 Bot Live via Webhook on port ${PORT}`);
   scan();
   setInterval(scan, 60000);
-  setInterval(monitorPositions, 2 * 60 * 1000);
+
+  // ✅ PnL monitor every 30 seconds with live prices
+  setInterval(monitorPositions, 30 * 1000);
+
+  // Self-ping every 5 minutes
   setInterval(async () => {
     try {
       await axios.get(DOMAIN, { timeout: 5000 });
@@ -524,7 +575,6 @@ bot.command('positions', async (ctx) => {
   ctx.reply(lines.join('\n'), { parse_mode: 'Markdown' });
 });
 
-// ✅ /pnl command — inline keyboard of alerted tokens
 bot.command('pnl', async (ctx) => {
   if (alertHistory.size === 0) {
     return ctx.reply('📭 No alerts recorded yet. Wait for the bot to call some tokens.');
@@ -550,15 +600,10 @@ bot.command('pnl', async (ctx) => {
   );
 });
 
-// ✅ Handle /pnl token selection
 bot.action(/^pnl_(.+)$/, async (ctx) => {
   const address = ctx.match[1];
   const rec = alertHistory.get(address);
-
-  if (!rec) {
-    return ctx.answerCbQuery('Token not found in history.');
-  }
-
+  if (!rec) return ctx.answerCbQuery('Token not found in history.');
   await ctx.answerCbQuery();
 
   const alertDate = new Date(rec.alertTime).toUTCString();
@@ -572,7 +617,6 @@ bot.action(/^pnl_(.+)$/, async (ctx) => {
   const peakMcapGain = rec.alertMcap > 0
     ? ((rec.peakMcap - rec.alertMcap) / rec.alertMcap) * 100
     : 0;
-
   const neverPumped = rec.peakPrice <= rec.alertPrice;
 
   const lines = [
