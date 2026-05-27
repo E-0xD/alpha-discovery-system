@@ -787,22 +787,47 @@ bot.command('winrate', async (ctx) => {
   let totalCalls = 0;
   let hitsPeak = 0;
   let hitsStopLoss = 0;
+  let totalGainPct = 0;
+  let totalLossPct = 0;
 
   for (const rec of alertHistory.values()) {
     totalCalls++;
-    if (rec.peakPrice > rec.alertPrice) hitsPeak++;
-    if (rec.currentPrice <= (rec.alertPrice * 0.7)) hitsStopLoss++;
+
+    if (rec.peakPrice > rec.alertPrice) {
+      hitsPeak++;
+      const gainPct = ((rec.peakPrice - rec.alertPrice) / rec.alertPrice) * 100;
+      totalGainPct += gainPct;
+    }
+
+    if (rec.currentPrice <= (rec.alertPrice * 0.7)) {
+      hitsStopLoss++;
+      totalLossPct += 30;
+    }
   }
 
-  const winRate = ((hitsPeak / totalCalls) * 100).toFixed(1);
-  const slRate = ((hitsStopLoss / totalCalls) * 100).toFixed(1);
+  const neutrals = totalCalls - hitsPeak - hitsStopLoss;
+  const hitRate = ((hitsPeak / totalCalls) * 100).toFixed(1);
+  const netPnl = totalGainPct - totalLossPct;
+  const avgPerTrade = (netPnl / totalCalls).toFixed(1);
+  const winRate = totalGainPct + totalLossPct > 0
+    ? ((totalGainPct / (totalGainPct + totalLossPct)) * 100).toFixed(1)
+    : '0.0';
+  const netEmoji = netPnl >= 0 ? '🟢' : '🔴';
+  const winEmoji = parseFloat(winRate) >= 50 ? '🟢' : '🔴';
 
   await ctx.reply(
     `📊 *Bot Performance Summary*\n\n` +
     `• *Total Tokens Called:* ${totalCalls}\n` +
-    `• *Pumped above entry:* ${hitsPeak} (${winRate}%)\n` +
-    `• *Hit 30% Stop Loss:* ${hitsStopLoss} (${slRate}%)\n`,
-    { parse_mode: 'Markdown' }
+    `• *Pumped Above Entry:* ${hitsPeak}\n` +
+    `• *Hit 30% Stop Loss:* ${hitsStopLoss}\n` +
+    `• *Neutral (no move):* ${neutrals}\n` +
+    `• *Hit Rate:* ${hitsPeak}/${totalCalls} \\(${hitRate}%\\)\n\n` +
+    `💹 *Net Gain:* 🟢 \\+${totalGainPct.toFixed(1)}%\n` +
+    `🔻 *Net Loss:* 🔴 \\-${totalLossPct.toFixed(1)}%\n` +
+    `📉 *Net PnL:* ${netEmoji} ${netPnl >= 0 ? '\\+' : ''}${netPnl.toFixed(1)}%\n` +
+    `🎯 *Avg Per Trade:* ${netEmoji} ${parseFloat(avgPerTrade) >= 0 ? '\\+' : ''}${avgPerTrade}%\n` +
+    `📈 *Win Rate:* ${winEmoji} ${winRate}%`,
+    { parse_mode: 'MarkdownV2' }
   );
 });
 
