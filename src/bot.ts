@@ -511,7 +511,7 @@ async function scan() {
 
         const rugProb = computeRugProbability(mcap, liquidity);
         const alphaScore = computeAlphaScore(mcap, liquidity, rugProb);
-        const scoreMin = isNew ? 75 : 85;
+        const scoreMin = isNew ? 70 : 75;
 
         console.log(`[${p.source}] ${ticker}: MCAP $${mcap} | Liq $${liquidity} | Score ${alphaScore}/100`);
 
