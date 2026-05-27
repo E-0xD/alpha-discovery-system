@@ -6,22 +6,9 @@ import { OnChainPatternRecognition } from './intelligence';
 import { CapitalRiskEngine } from './risk';
 import { LowLatencyExecutionEngine } from './execution';
 import { TokenSignal } from './types';
+import { db } from './db';
 import Redis from 'ioredis';
 const redis = new Redis(process.env.REDIS_URL || '');
-// 🛑 Uptime setup disabled 
-/*
-import express from 'express';
-const app = express();
-const port = process.env.PORT || 3000;
-
-app.get('/ping', (req, res) => {
-  res.status(200).send('Degen Sniper is awake and hunting! 🎯');
-});
-
-app.listen(port, () => {
-  console.log(`🌐 Anti-Sleep Server running on port ${port}`);
-});
-*/
 
 dotenv.config();
 
@@ -35,7 +22,32 @@ const executor = new LowLatencyExecutionEngine();
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const DOMAIN = process.env.RENDER_EXTERNAL_URL || 'https://alpha-discovery-system.onrender.com';
 
-const seenTokens = new Set<string>();
+// ✅ FIX 1: TTL-based seenTokens — tokens expire after 2 hours instead of blocking forever
+const seenTokens = new Map<string, number>(); // address -> timestamp when seen
+const SEEN_TOKEN_TTL = 2 * 60 * 60 * 1000; // 2 hours
+
+function markTokenSeen(address: string) {
+  seenTokens.set(address, Date.now());
+}
+
+function isTokenSeen(address: string): boolean {
+  const seenAt = seenTokens.get(address);
+  if (!seenAt) return false;
+  // If older than TTL, remove it and treat as unseen
+  if (Date.now() - seenAt > SEEN_TOKEN_TTL) {
+    seenTokens.delete(address);
+    return false;
+  }
+  return true;
+}
+
+// Periodically clean up expired entries to prevent memory bloat
+setInterval(() => {
+  const now = Date.now();
+  for (const [addr, ts] of seenTokens.entries()) {
+    if (now - ts > SEEN_TOKEN_TTL) seenTokens.delete(addr);
+  }
+}, 30 * 60 * 1000); // every 30 minutes
 
 // ✅ NEW: WebSocket Queue for Pump.fun tokens
 const wssPumpTokensQueue: any[] = [];
@@ -65,14 +77,62 @@ interface AlertRecord {
 }
 let alertHistory = new Map<string, AlertRecord>();
 
-// Automatically load your previous history when the bot wakes up
-redis.get('bot_history').then((data) => {
-    if (data) {
-        alertHistory = new Map(JSON.parse(data));
-        console.log('✅ History loaded from Redis');
+// ✅ FIX 2: Load positions from Supabase on startup (survives deploys)
+async function loadPositionsFromDb() {
+  try {
+    const result = await db.query(
+      `SELECT * FROM active_positions WHERE status = 'OPEN'`
+    );
+    for (const row of result.rows) {
+      openPositions.set(row.token_address, {
+        ticker: row.ticker,
+        address: row.token_address,
+        entryPrice: parseFloat(row.entry_price_usd),
+        peakPrice: parseFloat(row.highest_price_usd || row.entry_price_usd),
+        sizeSol: parseFloat(row.size_sol),
+        entryTime: parseInt(row.timestamp) || Date.now()
+      });
     }
-});
+    console.log(`✅ Loaded ${openPositions.size} open positions from Supabase`);
+  } catch (err: any) {
+    console.log(`⚠️ Could not load positions from DB: ${err.message}`);
+  }
+}
 
+async function savePositionToDb(address: string, pos: Position) {
+  try {
+    await db.query(
+      `INSERT INTO active_positions (token_address, ticker, entry_price_usd, current_price_usd, size_sol, highest_price_usd, status, timestamp)
+       VALUES ($1, $2, $3, $4, $5, $6, 'OPEN', $7)
+       ON CONFLICT (token_address) DO UPDATE SET
+         current_price_usd = EXCLUDED.current_price_usd,
+         highest_price_usd = EXCLUDED.highest_price_usd,
+         status = EXCLUDED.status`,
+      [address, pos.ticker, pos.entryPrice, pos.entryPrice, pos.sizeSol, pos.peakPrice, pos.entryTime]
+    );
+  } catch (err: any) {
+    console.log(`⚠️ DB save position error: ${err.message}`);
+  }
+}
+
+async function closePositionInDb(address: string) {
+  try {
+    await db.query(
+      `UPDATE active_positions SET status = 'CLOSED' WHERE token_address = $1`,
+      [address]
+    );
+  } catch (err: any) {
+    console.log(`⚠️ DB close position error: ${err.message}`);
+  }
+}
+
+// Load history from Redis on startup
+redis.get('bot_history').then((data) => {
+  if (data) {
+    alertHistory = new Map(JSON.parse(data));
+    console.log(`✅ History loaded from Redis: ${alertHistory.size} alerts`);
+  }
+});
 
 function escapeText(text: string): string {
   return String(text).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
@@ -129,37 +189,37 @@ function isReversalCandidate(pair: any): boolean {
 
 // ✅ Background WebSocket Listener for Pump.fun
 function startPumpPortalStream() {
-    console.log("🔗 Connecting to PumpPortal WSS (Bypassing Cloudflare)...");
-    const ws = new WebSocket('wss://pumpportal.fun/api/data');
+  console.log("🔗 Connecting to PumpPortal WSS (Bypassing Cloudflare)...");
+  const ws = new WebSocket('wss://pumpportal.fun/api/data');
 
-    ws.on('open', () => {
-        console.log("🟢 WSS Connected! Streaming new token launches...");
-        ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
-    });
+  ws.on('open', () => {
+    console.log("🟢 WSS Connected! Streaming new token launches...");
+    ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
+  });
 
-    ws.on('message', (data: any) => {
-        try {
-            const token = JSON.parse(data.toString());
-            if (token.mint && token.symbol) {
-                wssPumpTokensQueue.push({
-                    tokenAddress: token.mint,
-                    source: 'pumpfun-new',
-                    cachedMcap: token.vSolInBondingCurve || 30000,
-                    cachedName: token.symbol,
-                    createdAt: Date.now()
-                });
-            }
-        } catch (e) {}
-    });
+  ws.on('message', (data: any) => {
+    try {
+      const token = JSON.parse(data.toString());
+      if (token.mint && token.symbol) {
+        wssPumpTokensQueue.push({
+          tokenAddress: token.mint,
+          source: 'pumpfun-new',
+          cachedMcap: token.vSolInBondingCurve || 30000,
+          cachedName: token.symbol,
+          createdAt: Date.now()
+        });
+      }
+    } catch (e) {}
+  });
 
-    ws.on('close', () => {
-        console.log("🔴 WSS Disconnected. Reconnecting...");
-        setTimeout(startPumpPortalStream, 5000);
-    });
+  ws.on('close', () => {
+    console.log("🔴 WSS Disconnected. Reconnecting...");
+    setTimeout(startPumpPortalStream, 5000);
+  });
 
-    ws.on('error', (err: any) => {
-        console.error("⚠️ WSS Error:", err.message);
-    });
+  ws.on('error', (err: any) => {
+    console.error("⚠️ WSS Error:", err.message);
+  });
 }
 
 async function getLivePrice(address: string): Promise<{ price: number; mcap: number }> {
@@ -214,17 +274,11 @@ async function getLivePrice(address: string): Promise<{ price: number; mcap: num
 }
 
 async function monitorPositions() {
-  const now = Date.now();
-  const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
-
-  const recentAlerts = [...alertHistory.keys()].filter(addr => {
-    const rec = alertHistory.get(addr);
-    return rec && (now - rec.alertTime) < TWENTY_FOUR_HOURS;
-  });
-
+  // ✅ FIX 3: Monitor ALL alerts in history — no 24-hour cutoff
+  // Peak tracking works from the original alert price forever
   const allAddresses = new Set([
     ...openPositions.keys(),
-    ...recentAlerts
+    ...alertHistory.keys()
   ]);
 
   if (allAddresses.size === 0) return;
@@ -236,11 +290,11 @@ async function monitorPositions() {
 
       if (alertHistory.has(address)) {
         const rec = alertHistory.get(address)!;
-        const updated: AlertRecord = { ...rec, currentPrice, currentMcap, lastUpdated: now };
+        const updated: AlertRecord = { ...rec, currentPrice, currentMcap, lastUpdated: Date.now() };
         if (currentPrice > rec.peakPrice) {
           updated.peakPrice = currentPrice;
           updated.peakMcap = currentMcap;
-          updated.peakTime = now;
+          updated.peakTime = Date.now();
           console.log(`📈 New peak ${rec.ticker}: $${currentPrice.toFixed(8)} (+${(((currentPrice - rec.alertPrice) / rec.alertPrice) * 100).toFixed(1)}%)`);
         }
         alertHistory.set(address, updated);
@@ -248,9 +302,18 @@ async function monitorPositions() {
 
       if (openPositions.has(address)) {
         const pos = openPositions.get(address)!;
+        const now = Date.now();
         const updated = { ...pos };
         if (currentPrice > pos.peakPrice) updated.peakPrice = currentPrice;
         openPositions.set(address, updated);
+
+        // ✅ Also update peak in DB
+        try {
+          await db.query(
+            `UPDATE active_positions SET current_price_usd = $1, highest_price_usd = $2 WHERE token_address = $3`,
+            [currentPrice, updated.peakPrice, address]
+          );
+        } catch {}
 
         const pnlPct = ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
         const dropFromPeak = ((currentPrice - updated.peakPrice) / updated.peakPrice) * 100;
@@ -282,6 +345,7 @@ async function monitorPositions() {
           ].join('\n');
           await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
           openPositions.delete(address);
+          await closePositionInDb(address); // ✅ Mark closed in DB too
           console.log(`✅ Closed: ${pos.ticker} ${pnlPct.toFixed(1)}%`);
         }
       }
@@ -289,6 +353,9 @@ async function monitorPositions() {
       console.log(`❌ Monitor error ${address}: ${err.message}`);
     }
   }));
+
+  // ✅ Save updated peaks to Redis after each monitoring cycle
+  await saveHistory();
 }
 
 async function scan() {
@@ -402,7 +469,8 @@ async function scan() {
       try {
         await new Promise(resolve => setTimeout(resolve, 800));
 
-        if (seenTokens.has(p.tokenAddress)) continue;
+        // ✅ FIX 1: Use TTL-based check instead of permanent Set
+        if (isTokenSeen(p.tokenAddress)) continue;
 
         let pair = p.cachedPair || null;
         if (!pair) {
@@ -413,7 +481,7 @@ async function scan() {
             );
             pair = data?.pairs?.[0];
           } catch {
-            seenTokens.add(p.tokenAddress);
+            markTokenSeen(p.tokenAddress); // ✅ TTL-based
             continue;
           }
         }
@@ -430,14 +498,14 @@ async function scan() {
         const currentPrice = parseFloat(pair?.priceUsd || '0');
 
         if (!liquidity && mcap > 0) liquidity = mcap * 0.15;
-        if (!mcap) { seenTokens.add(p.tokenAddress); continue; }
+        if (!mcap) { markTokenSeen(p.tokenAddress); continue; }
 
         const isNew = p.source === 'pumpfun-new' || p.source === 'dex-new';
         const isReversal = p.source === 'reversal';
         const mcapMin = isNew ? 500 : 1000;
 
         if (mcap < mcapMin || mcap > 40000) {
-          seenTokens.add(p.tokenAddress);
+          markTokenSeen(p.tokenAddress); // ✅ TTL-based
           continue;
         }
 
@@ -448,7 +516,7 @@ async function scan() {
         console.log(`[${p.source}] ${ticker}: MCAP $${mcap} | Liq $${liquidity} | Score ${alphaScore}/100`);
 
         if (alphaScore < scoreMin) {
-          seenTokens.add(p.tokenAddress);
+          markTokenSeen(p.tokenAddress); // ✅ TTL-based
           continue;
         }
 
@@ -468,7 +536,7 @@ async function scan() {
 
         if (!pattern.passedPatterns) {
           console.log(`⏭ ${ticker} failed: ${pattern.reason}`);
-          seenTokens.add(p.tokenAddress);
+          markTokenSeen(p.tokenAddress); // ✅ TTL-based
           continue;
         }
 
@@ -485,7 +553,6 @@ async function scan() {
             tx.sign([executor.getWalletKeypair()]);
             const result = await executor.dispatchMevProtectedBundle(tx);
             if (result.success) {
-              // ✅ Show Solscan link with real transaction signature
               const txLink = result.bundleId
                 ? ` — [Solscan](https://solscan.io/tx/${result.bundleId})`
                 : '';
@@ -493,20 +560,21 @@ async function scan() {
               executedSizeSol = risk.sizeSol;
               executedPrice = currentPrice;
               if (executedPrice > 0) {
-                openPositions.set(address, {
+                const pos: Position = {
                   ticker, address,
                   entryPrice: executedPrice,
                   peakPrice: executedPrice,
                   sizeSol: executedSizeSol,
                   entryTime: Date.now()
-                });
+                };
+                openPositions.set(address, pos);
+                await savePositionToDb(address, pos); // ✅ Persist to Supabase
                 console.log(`📌 Position opened: ${ticker} @ $${executedPrice}`);
               }
             } else {
               executionState = `❌ Auto\\-Buy Failed: ${escapeText(result.error || '')}`;
             }
-                    } catch (execErr: any) {
-            // 👇 THIS LINE REVEALS THE EXACT JUPITER ERROR IN YOUR RENDER LOGS 👇
+          } catch (execErr: any) {
             console.log("🔥 AUTO-BUY REJECTION REASON:", JSON.stringify(execErr.response?.data || execErr.message));
 
             const isNetworkErr = execErr.message?.includes('ENOTFOUND') || execErr.message?.includes('ECONNREFUSED');
@@ -531,7 +599,6 @@ async function scan() {
           currentPrice,
           lastUpdated: Date.now()
         });
- // This tells the bot to wait until it saves to the Memory Box
         await saveHistory();
 
         const walletShort = `${executor.getWalletPublicKey().slice(0, 8)}...${executor.getWalletPublicKey().slice(-4)}`;
@@ -582,8 +649,7 @@ async function scan() {
         await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
         console.log(`✅ Alert sent: ${ticker} — Score: ${alphaScore}/100 — Source: ${p.source}`);
 
-        seenTokens.add(p.tokenAddress);
-        if (seenTokens.size > 500) seenTokens.clear();
+        markTokenSeen(p.tokenAddress); // ✅ TTL-based
 
       } catch (innerErr: any) {
         console.log(`❌ Error on token: ${innerErr.message}`);
@@ -596,8 +662,11 @@ async function scan() {
 
 bot.launch({
   webhook: { domain: DOMAIN, port: PORT }
-}).then(() => {
+}).then(async () => {
   console.log(`🤖 Bot Live via Webhook on port ${PORT}`);
+
+  // ✅ Load persisted positions from Supabase on startup
+  await loadPositionsFromDb();
 
   // ✅ Start WebSocket listener on launch
   startPumpPortalStream();
@@ -634,13 +703,66 @@ bot.command('positions', async (ctx) => {
   ctx.reply(lines.join('\n'), { parse_mode: 'Markdown' });
 });
 
+// ✅ FIX 4: /pnl command with time period grouping
 bot.command('pnl', async (ctx) => {
   if (alertHistory.size === 0) {
     return ctx.reply('📭 No alerts recorded yet. Wait for the bot to call some tokens.');
   }
 
-  const buttons = Array.from(alertHistory.entries())
-    .sort((a, b) => b[1].alertTime - a[1].alertTime)
+  await ctx.reply(
+    '📊 *Select a time period:*',
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('📅 Today', 'pnl_period_today')],
+        [Markup.button.callback('📅 This Week', 'pnl_period_week')],
+        [Markup.button.callback('📅 This Month', 'pnl_period_month')],
+        [Markup.button.callback('📅 Lifetime', 'pnl_period_lifetime')],
+      ])
+    }
+  );
+});
+
+bot.action(/^pnl_period_(.+)$/, async (ctx) => {
+  const period = ctx.match[1];
+  await ctx.answerCbQuery();
+
+  const now = Date.now();
+  let cutoff = 0;
+  let periodLabel = '';
+
+  switch (period) {
+    case 'today':
+      // Start of today UTC
+      const todayStart = new Date();
+      todayStart.setUTCHours(0, 0, 0, 0);
+      cutoff = todayStart.getTime();
+      periodLabel = 'Today';
+      break;
+    case 'week':
+      cutoff = now - (7 * 24 * 60 * 60 * 1000);
+      periodLabel = 'This Week';
+      break;
+    case 'month':
+      cutoff = now - (30 * 24 * 60 * 60 * 1000);
+      periodLabel = 'This Month';
+      break;
+    case 'lifetime':
+    default:
+      cutoff = 0;
+      periodLabel = 'Lifetime';
+      break;
+  }
+
+  const filtered = Array.from(alertHistory.entries())
+    .filter(([_, rec]) => rec.alertTime >= cutoff)
+    .sort((a, b) => b[1].alertTime - a[1].alertTime);
+
+  if (filtered.length === 0) {
+    return ctx.reply(`📭 No alerts found for period: ${periodLabel}`);
+  }
+
+  const buttons = filtered
     .slice(0, 20)
     .map(([address, rec]) => {
       const pnlPct = rec.peakPrice > rec.alertPrice
@@ -651,7 +773,7 @@ bot.command('pnl', async (ctx) => {
     });
 
   await ctx.reply(
-    '📊 *Select a token to see its PnL since alert:*',
+    `📊 *PnL — ${escapeText(periodLabel)}* (${filtered.length} tokens)`,
     {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard(buttons)
@@ -663,14 +785,12 @@ bot.command('winrate', async (ctx) => {
   if (alertHistory.size === 0) return ctx.reply('📭 No data to analyze yet.');
 
   let totalCalls = 0;
-  let hitsPeak = 0;   // Tokens that pumped above entry
-  let hitsStopLoss = 0; // Tokens that dropped 30% or more
+  let hitsPeak = 0;
+  let hitsStopLoss = 0;
 
   for (const rec of alertHistory.values()) {
     totalCalls++;
-    // Did it pump above entry?
     if (rec.peakPrice > rec.alertPrice) hitsPeak++;
-    // Did it hit 30% SL? (Current price is 70% or less of entry)
     if (rec.currentPrice <= (rec.alertPrice * 0.7)) hitsStopLoss++;
   }
 
@@ -688,6 +808,9 @@ bot.command('winrate', async (ctx) => {
 
 bot.action(/^pnl_(.+)$/, async (ctx) => {
   const address = ctx.match[1];
+  // Skip if it's a period selection (already handled above)
+  if (address.startsWith('period_')) return;
+
   const rec = alertHistory.get(address);
   if (!rec) return ctx.answerCbQuery('Token not found in history.');
   await ctx.answerCbQuery();
@@ -740,22 +863,20 @@ bot.action(/^pnl_(.+)$/, async (ctx) => {
 });
 
 // --- HEARTBEAT TIMER ---
-// This forces the bot to stay awake and check in every 15 minutes
 setInterval(() => {
-  // Pulls the chat ID directly from your Render environment variables
-  const chatID = process.env.TELEGRAM_CHAT_ID; 
-  
+  const chatID = process.env.TELEGRAM_CHAT_ID;
+
   if (chatID) {
     bot.telegram.sendMessage(
-      chatID, 
+      chatID,
       "⏱️ *Heartbeat:* Bot is awake and monitoring the market...",
       { parse_mode: 'Markdown' }
     ).catch((err: any) => console.log("Heartbeat error:", err.message));
   } else {
     console.log("Error: TELEGRAM_CHAT_ID environment variable is missing.");
   }
-  
-}, 15 * 60 * 1000); // 15 minutes in milliseconds
+
+}, 15 * 60 * 1000);
 
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
