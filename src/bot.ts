@@ -703,6 +703,38 @@ bot.command('positions', async (ctx) => {
 });
 
 // ── Helper: build collective PnL token list for a period ──
+function getPeriodDateString(period: string): string {
+  const today = new Date();
+  const formatDate = (d: Date) => d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  const todayStr = formatDate(today);
+
+  let dateString = '';
+
+  if (period === 'daily') {
+    dateString = todayStr;
+  } else if (period === 'weekly') {
+    const lastWeek = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000);
+    dateString = `${formatDate(lastWeek)} - ${todayStr}`;
+  } else if (period === 'monthly') {
+    const lastMonth = new Date(today.getTime() - 30 * 24 * 60 * 60 * 1000);
+    dateString = `${formatDate(lastMonth)} - ${todayStr}`;
+  } else if (period === 'lifetime') {
+    let firstDate = new Date();
+    if (alertHistory.size > 0) {
+      // Memory-safe loop to find the oldest alert date without exceeding the call stack
+      let earliest = Date.now();
+      for (const r of alertHistory.values()) {
+        if (r.alertTime < earliest) earliest = r.alertTime;
+      }
+      firstDate = new Date(earliest);
+    }
+    dateString = `${formatDate(firstDate)} - ${todayStr}`;
+  }
+  
+  // Safely escape the generated string (specifically hyphens) for Telegram Markdown
+  return escapeText(dateString);
+}
+
 async function buildPeriodPnlMessage(period: string): Promise<{ text: string; buttons: any[] }> {
   const now = Date.now();
   const periodMs: Record<string, number> = {
@@ -733,8 +765,10 @@ async function buildPeriodPnlMessage(period: string): Promise<{ text: string; bu
   // Add refresh button at the bottom
   buttons.push([Markup.button.callback('🔄 Refresh', `period_${period}`)]);
 
+  const dateInterval = getPeriodDateString(period);
+
   return {
-    text: `📊 *${periodLabel[period]} Calls \\(${filtered.length} tokens\\):*`,
+    text: `📊 *${periodLabel[period]} Calls \\(${dateInterval}\\) \\(${filtered.length} tokens\\):*`,
     buttons
   };
 }
