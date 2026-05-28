@@ -16,6 +16,15 @@ dotenv.config();
 const PORT = Number(process.env.PORT) || 10000;
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN || '');
+// ── Security: only respond in authorized chat ──
+bot.use(async (ctx, next) => {
+  const chatId = ctx.chat?.id?.toString();
+  if (chatId !== CHAT_ID) {
+    console.log(`🚫 Unauthorized access attempt from chat: ${chatId}`);
+    return; // silently ignore — don't respond at all
+  }
+  return next();
+});
 const intelligence = new OnChainPatternRecognition();
 const riskEngine = new CapitalRiskEngine();
 const executor = new LowLatencyExecutionEngine();
