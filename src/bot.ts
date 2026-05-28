@@ -293,8 +293,8 @@ async function monitorPositions() {
         const holdingMins = Math.floor((now - pos.entryTime) / 60000);
 
         // ── DYNAMIC TRAILING STOP LOSS ──
-        // Level 1: profit hits +10% to +15% → move stop loss to -10% below entry
-        if (pnlPct >= 10 && updated.stopLossLevel === 'initial') {
+        // Level 1: profit hits +15% → move stop loss to -10% below entry
+        if (pnlPct >= 15 && updated.stopLossLevel === 'initial') {
           updated.stopLossLevel = 'breakeven';
           updated.stopLossPct = -10;
           console.log(`🔒 ${pos.ticker} stop loss moved to -10% below entry (profit: +${pnlPct.toFixed(1)}%)`);
@@ -304,13 +304,13 @@ async function monitorPositions() {
           );
         }
 
-        // Level 2: profit hits +25% to +30% → move stop loss to +2% above entry
-        if (pnlPct >= 25 && updated.stopLossLevel === 'breakeven') {
+        // Level 2: profit hits +60% → move stop loss to +2% above entry (locks in profit)
+        if (pnlPct >= 60 && updated.stopLossLevel === 'breakeven') {
           updated.stopLossLevel = 'trailing';
           updated.stopLossPct = 2;
-          console.log(`🔒 ${pos.ticker} stop loss moved to +2% above entry (profit: +${pnlPct.toFixed(1)}%)`);
+          console.log(`🔐 ${pos.ticker} stop loss locked to +2% above entry (profit: +${pnlPct.toFixed(1)}%)`);
           await bot.telegram.sendMessage(CHAT_ID,
-            `🔐 *STOP LOSS IN PROFIT*\n\n*Token:* $${escapeText(pos.ticker)}\n*Profit hit:* +${pnlPct.toFixed(1)}%\n*Stop loss moved to:* +2% above entry\n*This trade cannot lose now*`,
+            `🔐 *STOP LOSS LOCKED IN PROFIT*\n\n*Token:* $${escapeText(pos.ticker)}\n*Profit hit:* +${pnlPct.toFixed(1)}%\n*Stop loss moved to:* +2% above entry\n*This trade cannot lose now*`,
             { parse_mode: 'Markdown' }
           );
         }
@@ -368,7 +368,7 @@ async function monitorPositions() {
           const stopLabel =
             updated.stopLossLevel === 'trailing' ? '🔐 TRAILING STOP — +2% Above Entry' :
             updated.stopLossLevel === 'breakeven' ? '🔒 DYNAMIC STOP — -10% Below Entry' :
-            '🛑 STOP LOSS — -30% Hit';
+            '🛑 STOP LOSS — -20% Hit';
 
           const msg = [
             `💰 *POSITION CLOSED*`, ``,
@@ -553,7 +553,7 @@ if (!isNew && pair?.pairCreatedAt) {
                   entryTime: Date.now(),
                   // ── Start with initial stop loss at -30% ──
                   stopLossLevel: 'initial',
-                  stopLossPct: -30,
+                  stopLossPct: -20,
                   remainingPct: 100,
                 });
                 console.log(`📌 Position opened: ${ticker} @ $${executedPrice}`);
