@@ -6,8 +6,9 @@ import { OnChainPatternRecognition } from './intelligence';
 import { CapitalRiskEngine } from './risk';
 import { LowLatencyExecutionEngine } from './execution';
 import { TokenSignal } from './types';
-import { db } from './db';
 import Redis from 'ioredis';
+import { db, initDatabaseSchema } from './db';
+
 const redis = new Redis(process.env.REDIS_URL || '');
 
 dotenv.config();
@@ -22,30 +23,7 @@ const executor = new LowLatencyExecutionEngine();
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const DOMAIN = process.env.RENDER_EXTERNAL_URL || 'https://alpha-discovery-system.onrender.com';
 
-const seenTokens = new Map<string, number>();
-const SEEN_TOKEN_TTL = 2 * 60 * 60 * 1000;
-
-function markTokenSeen(address: string) {
-  seenTokens.set(address, Date.now());
-}
-
-function isTokenSeen(address: string): boolean {
-  const seenAt = seenTokens.get(address);
-  if (!seenAt) return false;
-  if (Date.now() - seenAt > SEEN_TOKEN_TTL) {
-    seenTokens.delete(address);
-    return false;
-  }
-  return true;
-}
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [addr, ts] of seenTokens.entries()) {
-    if (now - ts > SEEN_TOKEN_TTL) seenTokens.delete(addr);
-  }
-}, 30 * 60 * 1000);
-
+const seenTokens = new Set<string>();
 const wssPumpTokensQueue: any[] = [];
 
 interface Position {
@@ -73,63 +51,84 @@ interface AlertRecord {
 }
 let alertHistory = new Map<string, AlertRecord>();
 
-async function loadPositionsFromDb() {
+// ✅ Load history from Redis first, then Supabase as fallback
+async function loadHistory() {
   try {
-    const result = await db.query(`SELECT * FROM active_positions WHERE status = 'OPEN'`);
+    const data = await redis.get('bot_history');
+    if (data) {
+      alertHistory = new Map(JSON.parse(data));
+      console.log(`✅ History loaded from Redis: ${alertHistory.size} records`);
+      return;
+    }
+  } catch (e) {
+    console.log('⚠️ Redis load failed, trying Supabase...');
+  }
+
+  // ✅ Supabase fallback
+  try {
+    const result = await db.query(`
+      SELECT address, ticker, alert_time, alert_mcap, alert_price,
+             peak_mcap, peak_price, peak_time, current_mcap, current_price, last_updated
+      FROM alert_history ORDER BY alert_time DESC LIMIT 500
+    `);
     for (const row of result.rows) {
-      openPositions.set(row.token_address, {
+      alertHistory.set(row.address, {
         ticker: row.ticker,
-        address: row.token_address,
-        entryPrice: parseFloat(row.entry_price_usd),
-        peakPrice: parseFloat(row.highest_price_usd || row.entry_price_usd),
-        sizeSol: parseFloat(row.size_sol),
-        entryTime: parseInt(row.timestamp) || Date.now()
+        address: row.address,
+        alertTime: Number(row.alert_time),
+        alertMcap: Number(row.alert_mcap),
+        alertPrice: Number(row.alert_price),
+        peakMcap: Number(row.peak_mcap),
+        peakPrice: Number(row.peak_price),
+        peakTime: Number(row.peak_time),
+        currentMcap: Number(row.current_mcap),
+        currentPrice: Number(row.current_price),
+        lastUpdated: Number(row.last_updated)
       });
     }
-    console.log(`✅ Loaded ${openPositions.size} open positions from Supabase`);
-  } catch (err: any) {
-    console.log(`⚠️ Could not load positions from DB: ${err.message}`);
+    console.log(`✅ History loaded from Supabase: ${alertHistory.size} records`);
+  } catch (e: any) {
+    console.log(`⚠️ Supabase load failed: ${e.message}`);
   }
 }
 
-async function savePositionToDb(address: string, pos: Position) {
+// ✅ Save to both Redis and Supabase
+async function saveHistory() {
+  // Redis save
   try {
-    await db.query(
-      `INSERT INTO active_positions (token_address, ticker, entry_price_usd, current_price_usd, size_sol, highest_price_usd, status, timestamp)
-       VALUES ($1, $2, $3, $4, $5, $6, 'OPEN', $7)
-       ON CONFLICT (token_address) DO UPDATE SET
-         current_price_usd = EXCLUDED.current_price_usd,
-         highest_price_usd = EXCLUDED.highest_price_usd,
-         status = EXCLUDED.status`,
-      [address, pos.ticker, pos.entryPrice, pos.entryPrice, pos.sizeSol, pos.peakPrice, pos.entryTime]
-    );
-  } catch (err: any) {
-    console.log(`⚠️ DB save position error: ${err.message}`);
+    await redis.set('bot_history', JSON.stringify(Array.from(alertHistory.entries())));
+  } catch (e: any) {
+    console.log(`⚠️ Redis save failed: ${e.message}`);
   }
-}
 
-async function closePositionInDb(address: string) {
+  // Supabase save — upsert so peaks update but alertTime never changes
   try {
-    await db.query(`UPDATE active_positions SET status = 'CLOSED' WHERE token_address = $1`, [address]);
-  } catch (err: any) {
-    console.log(`⚠️ DB close position error: ${err.message}`);
+    for (const rec of alertHistory.values()) {
+      await db.query(`
+        INSERT INTO alert_history (
+          address, ticker, alert_time, alert_mcap, alert_price,
+          peak_mcap, peak_price, peak_time, current_mcap, current_price, last_updated
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+        ON CONFLICT (address) DO UPDATE SET
+          peak_mcap = GREATEST(alert_history.peak_mcap, EXCLUDED.peak_mcap),
+          peak_price = GREATEST(alert_history.peak_price, EXCLUDED.peak_price),
+          peak_time = CASE WHEN EXCLUDED.peak_price > alert_history.peak_price
+                     THEN EXCLUDED.peak_time ELSE alert_history.peak_time END,
+          current_mcap = EXCLUDED.current_mcap,
+          current_price = EXCLUDED.current_price,
+          last_updated = EXCLUDED.last_updated
+      `, [
+        rec.address, rec.ticker, rec.alertTime, rec.alertMcap, rec.alertPrice,
+        rec.peakMcap, rec.peakPrice, rec.peakTime, rec.currentMcap, rec.currentPrice, rec.lastUpdated
+      ]);
+    }
+  } catch (e: any) {
+    console.log(`⚠️ Supabase save failed: ${e.message}`);
   }
 }
-
-// Load history from Redis on startup
-redis.get('bot_history').then((data) => {
-  if (data) {
-    alertHistory = new Map(JSON.parse(data));
-    console.log(`✅ History loaded from Redis: ${alertHistory.size} alerts`);
-  }
-});
 
 function escapeText(text: string): string {
   return String(text).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
-}
-
-async function saveHistory() {
-  await redis.set('bot_history', JSON.stringify(Array.from(alertHistory.entries())));
 }
 
 function getDynamicMode(score: number): string {
@@ -145,8 +144,7 @@ function computeAlphaScore(mcap: number, liquidity: number, rugProb: number): nu
   else if (ratio >= 0.20) score += 30;
   else if (ratio >= 0.10) score += 20;
   else if (ratio >= 0.05) score += 10;
-  // ✅ Updated: 70k max
-  if (mcap >= 1000 && mcap <= 70000) score += 25;
+  if (mcap >= 1000 && mcap <= 40000) score += 25;
   if (liquidity >= 25000) score += 20;
   else if (liquidity >= 10000) score += 12;
   else if (liquidity >= 5000) score += 6;
@@ -179,10 +177,10 @@ function isReversalCandidate(pair: any): boolean {
 }
 
 function startPumpPortalStream() {
-  console.log("🔗 Connecting to PumpPortal WSS (Bypassing Cloudflare)...");
+  console.log("🔗 Connecting to PumpPortal WSS...");
   const ws = new WebSocket('wss://pumpportal.fun/api/data');
   ws.on('open', () => {
-    console.log("🟢 WSS Connected! Streaming new token launches...");
+    console.log("🟢 WSS Connected!");
     ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
   });
   ws.on('message', (data: any) => {
@@ -245,7 +243,15 @@ async function getLivePrice(address: string): Promise<{ price: number; mcap: num
 }
 
 async function monitorPositions() {
-  const allAddresses = new Set([...openPositions.keys(), ...alertHistory.keys()]);
+  const now = Date.now();
+  const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
+
+  const recentAlerts = [...alertHistory.keys()].filter(addr => {
+    const rec = alertHistory.get(addr);
+    return rec && (now - rec.alertTime) < TWENTY_FOUR_HOURS;
+  });
+
+  const allAddresses = new Set([...openPositions.keys(), ...recentAlerts]);
   if (allAddresses.size === 0) return;
 
   await Promise.all(Array.from(allAddresses).map(async (address) => {
@@ -255,11 +261,11 @@ async function monitorPositions() {
 
       if (alertHistory.has(address)) {
         const rec = alertHistory.get(address)!;
-        const updated: AlertRecord = { ...rec, currentPrice, currentMcap, lastUpdated: Date.now() };
+        const updated: AlertRecord = { ...rec, currentPrice, currentMcap, lastUpdated: now };
         if (currentPrice > rec.peakPrice) {
           updated.peakPrice = currentPrice;
           updated.peakMcap = currentMcap;
-          updated.peakTime = Date.now();
+          updated.peakTime = now;
           console.log(`📈 New peak ${rec.ticker}: $${currentPrice.toFixed(8)} (+${(((currentPrice - rec.alertPrice) / rec.alertPrice) * 100).toFixed(1)}%)`);
         }
         alertHistory.set(address, updated);
@@ -267,17 +273,9 @@ async function monitorPositions() {
 
       if (openPositions.has(address)) {
         const pos = openPositions.get(address)!;
-        const now = Date.now();
         const updated = { ...pos };
         if (currentPrice > pos.peakPrice) updated.peakPrice = currentPrice;
         openPositions.set(address, updated);
-
-        try {
-          await db.query(
-            `UPDATE active_positions SET current_price_usd = $1, highest_price_usd = $2 WHERE token_address = $3`,
-            [currentPrice, updated.peakPrice, address]
-          );
-        } catch {}
 
         const pnlPct = ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
         const dropFromPeak = ((currentPrice - updated.peakPrice) / updated.peakPrice) * 100;
@@ -306,7 +304,6 @@ async function monitorPositions() {
           ].join('\n');
           await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
           openPositions.delete(address);
-          await closePositionInDb(address);
           console.log(`✅ Closed: ${pos.ticker} ${pnlPct.toFixed(1)}%`);
         }
       }
@@ -315,6 +312,7 @@ async function monitorPositions() {
     }
   }));
 
+  // Save updated peaks to storage
   await saveHistory();
 }
 
@@ -354,7 +352,7 @@ async function scan() {
           p.pairCreatedAt && (Date.now() - p.pairCreatedAt) < 2 * 60 * 60 * 1000
         )
         .map((p: any) => ({ tokenAddress: p.baseToken.address, source: 'dex-new', cachedPair: p }));
-      console.log(`New DEX pairs: ${newDexPairs.length} (last 2hrs)`);
+      console.log(`New DEX pairs: ${newDexPairs.length}`);
     } catch (dErr: any) { console.log(`⚠️ New DEX pairs failed: ${dErr.message}`); }
 
     let reversalTokens: any[] = [];
@@ -366,8 +364,7 @@ async function scan() {
           p.chainId === 'solana' &&
           isReversalCandidate(p) &&
           parseFloat(p.fdv || p.marketCap || '0') >= 1000 &&
-          // ✅ Updated: 70k max
-          parseFloat(p.fdv || p.marketCap || '0') <= 70000
+          parseFloat(p.fdv || p.marketCap || '0') <= 40000
         )
         .map((p: any) => ({ tokenAddress: p.baseToken.address, source: 'reversal', cachedPair: p }));
       console.log(`Reversals: ${reversalTokens.length}`);
@@ -387,7 +384,7 @@ async function scan() {
     for (const p of allCandidates.slice(0, 40)) {
       try {
         await new Promise(resolve => setTimeout(resolve, 800));
-        if (isTokenSeen(p.tokenAddress)) continue;
+        if (seenTokens.has(p.tokenAddress)) continue;
 
         let pair = p.cachedPair || null;
         if (!pair) {
@@ -395,7 +392,7 @@ async function scan() {
             const { data } = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${p.tokenAddress}`, { timeout: 8000 });
             pair = data?.pairs?.[0];
           } catch {
-            markTokenSeen(p.tokenAddress);
+            seenTokens.add(p.tokenAddress);
             continue;
           }
         }
@@ -408,25 +405,21 @@ async function scan() {
         const currentPrice = parseFloat(pair?.priceUsd || '0');
 
         if (!liquidity && mcap > 0) liquidity = mcap * 0.15;
-        if (!mcap) { markTokenSeen(p.tokenAddress); continue; }
+        if (!mcap) { seenTokens.add(p.tokenAddress); continue; }
 
         const isNew = p.source === 'pumpfun-new' || p.source === 'dex-new';
         const isReversal = p.source === 'reversal';
         const mcapMin = isNew ? 500 : 1000;
 
-        // ✅ Updated: 70k max
-        if (mcap < mcapMin || mcap > 70000) {
-          markTokenSeen(p.tokenAddress);
-          continue;
-        }
+        if (mcap < mcapMin || mcap > 40000) { seenTokens.add(p.tokenAddress); continue; }
 
         const rugProb = computeRugProbability(mcap, liquidity);
         const alphaScore = computeAlphaScore(mcap, liquidity, rugProb);
-        const scoreMin = isNew ? 70 : 75;
+        const scoreMin = isNew ? 75 : 85;
 
         console.log(`[${p.source}] ${ticker}: MCAP $${mcap} | Liq $${liquidity} | Score ${alphaScore}/100`);
 
-        if (alphaScore < scoreMin) { markTokenSeen(p.tokenAddress); continue; }
+        if (alphaScore < scoreMin) { seenTokens.add(p.tokenAddress); continue; }
 
         const signal: TokenSignal = {
           tokenAddress: address, ticker, alphaScore,
@@ -440,7 +433,7 @@ async function scan() {
 
         if (!pattern.passedPatterns) {
           console.log(`⏭ ${ticker} failed: ${pattern.reason}`);
-          markTokenSeen(p.tokenAddress);
+          seenTokens.add(p.tokenAddress);
           continue;
         }
 
@@ -462,12 +455,10 @@ async function scan() {
               executedSizeSol = risk.sizeSol;
               executedPrice = currentPrice;
               if (executedPrice > 0) {
-                const pos: Position = {
+                openPositions.set(address, {
                   ticker, address, entryPrice: executedPrice,
                   peakPrice: executedPrice, sizeSol: executedSizeSol, entryTime: Date.now()
-                };
-                openPositions.set(address, pos);
-                await savePositionToDb(address, pos);
+                });
                 console.log(`📌 Position opened: ${ticker} @ $${executedPrice}`);
               }
             } else {
@@ -484,7 +475,7 @@ async function scan() {
           executionState = `❌ Auto\\-Buy Blocked: ${escapeText(risk.reason || '')}`;
         }
 
-        // ✅ Only create new record if not already tracked — preserves original alertTime
+        // ✅ Only set alert record if NOT already tracked — preserve original alertTime
         if (!alertHistory.has(address)) {
           alertHistory.set(address, {
             ticker, address,
@@ -544,7 +535,8 @@ async function scan() {
         await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
         console.log(`✅ Alert sent: ${ticker} — Score: ${alphaScore}/100 — Source: ${p.source}`);
 
-        markTokenSeen(p.tokenAddress);
+        seenTokens.add(p.tokenAddress);
+        if (seenTokens.size > 500) seenTokens.clear();
 
       } catch (innerErr: any) {
         console.log(`❌ Error on token: ${innerErr.message}`);
@@ -555,11 +547,40 @@ async function scan() {
   }
 }
 
+// ✅ Initialize DB schema + load history before launching
+async function init() {
+  await initDatabaseSchema();
+
+  // ✅ Create alert_history table if not exists
+  try {
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS alert_history (
+        address TEXT PRIMARY KEY,
+        ticker TEXT,
+        alert_time BIGINT,
+        alert_mcap NUMERIC,
+        alert_price NUMERIC,
+        peak_mcap NUMERIC,
+        peak_price NUMERIC,
+        peak_time BIGINT,
+        current_mcap NUMERIC,
+        current_price NUMERIC,
+        last_updated BIGINT
+      );
+    `);
+    console.log('✅ alert_history table ready');
+  } catch (e: any) {
+    console.log(`⚠️ alert_history table setup failed: ${e.message}`);
+  }
+
+  await loadHistory();
+}
+
 bot.launch({
   webhook: { domain: DOMAIN, port: PORT }
 }).then(async () => {
   console.log(`🤖 Bot Live via Webhook on port ${PORT}`);
-  await loadPositionsFromDb();
+  await init();
   startPumpPortalStream();
   scan();
   setInterval(scan, 60000);
@@ -567,7 +588,8 @@ bot.launch({
   setInterval(async () => {
     try {
       await axios.get(DOMAIN, { timeout: 5000 });
-      console.log('🏓 Self-ping sent');
+      // ✅ Heartbeat to console only — not Telegram
+      console.log('🏓 Self-ping sent — bot is alive');
     } catch {}
   }, 5 * 60 * 1000);
 
@@ -591,61 +613,55 @@ bot.command('positions', async (ctx) => {
   ctx.reply(lines.join('\n'), { parse_mode: 'Markdown' });
 });
 
+// ✅ /pnl — period selector first, then token list
 bot.command('pnl', async (ctx) => {
   if (alertHistory.size === 0) {
-    return ctx.reply('📭 No alerts recorded yet. Wait for the bot to call some tokens.');
+    return ctx.reply('📭 No alerts recorded yet.');
   }
   await ctx.reply(
     '📊 *Select a time period:*',
     {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
-        [Markup.button.callback('📅 Today', 'pnl_period_today')],
-        [Markup.button.callback('📅 This Week', 'pnl_period_week')],
-        [Markup.button.callback('📅 This Month', 'pnl_period_month')],
-        [Markup.button.callback('📅 Lifetime', 'pnl_period_lifetime')],
+        [Markup.button.callback('📅 Daily', 'period_daily')],
+        [Markup.button.callback('📆 Weekly', 'period_weekly')],
+        [Markup.button.callback('🗓 Monthly', 'period_monthly')],
+        [Markup.button.callback('🏆 Lifetime', 'period_lifetime')],
       ])
     }
   );
 });
 
-bot.action(/^pnl_period_(.+)$/, async (ctx) => {
-  const period = ctx.match[1];
+// ✅ Period selector handler
+bot.action(/^period_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery();
-
+  const period = ctx.match[1];
   const now = Date.now();
-  let cutoff = 0;
-  let periodLabel = '';
 
-  switch (period) {
-    case 'today':
-      const todayStart = new Date();
-      todayStart.setUTCHours(0, 0, 0, 0);
-      cutoff = todayStart.getTime();
-      periodLabel = 'Today';
-      break;
-    case 'week':
-      cutoff = now - (7 * 24 * 60 * 60 * 1000);
-      periodLabel = 'This Week';
-      break;
-    case 'month':
-      cutoff = now - (30 * 24 * 60 * 60 * 1000);
-      periodLabel = 'This Month';
-      break;
-    case 'lifetime':
-    default:
-      cutoff = 0;
-      periodLabel = 'Lifetime';
-      break;
-  }
+  const periodMs: Record<string, number> = {
+    daily: 24 * 60 * 60 * 1000,
+    weekly: 7 * 24 * 60 * 60 * 1000,
+    monthly: 30 * 24 * 60 * 60 * 1000,
+    lifetime: Infinity
+  };
+
+  const cutoff = period === 'lifetime' ? 0 : now - periodMs[period];
 
   const filtered = Array.from(alertHistory.entries())
-    .filter(([_, rec]) => rec.alertTime >= cutoff)
-    .sort((a, b) => b[1].alertTime - a[1].alertTime);
+    .filter(([, rec]) => rec.alertTime >= cutoff)
+    .sort((a, b) => b[1].alertTime - a[1].alertTime)
+    .slice(0, 20);
 
-  if (filtered.length === 0) return ctx.reply(`📭 No alerts found for period: ${periodLabel}`);
+  if (filtered.length === 0) {
+    return ctx.reply(`📭 No alerts found for the selected period.`);
+  }
 
-  const buttons = filtered.slice(0, 20).map(([address, rec]) => {
+  const periodLabel: Record<string, string> = {
+    daily: '📅 Daily', weekly: '📆 Weekly',
+    monthly: '🗓 Monthly', lifetime: '🏆 Lifetime'
+  };
+
+  const buttons = filtered.map(([address, rec]) => {
     const pnlPct = rec.peakPrice > rec.alertPrice
       ? (((rec.peakPrice - rec.alertPrice) / rec.alertPrice) * 100).toFixed(1)
       : '0';
@@ -654,58 +670,38 @@ bot.action(/^pnl_period_(.+)$/, async (ctx) => {
   });
 
   await ctx.reply(
-    `📊 *PnL — ${escapeText(periodLabel)}* (${filtered.length} tokens)`,
-    { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
+    `📊 *${periodLabel[period]} Calls \\(${filtered.length} tokens\\):*`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard(buttons)
+    }
   );
 });
 
 bot.command('winrate', async (ctx) => {
   if (alertHistory.size === 0) return ctx.reply('📭 No data to analyze yet.');
 
-  let totalCalls = 0, hitsPeak = 0, hitsStopLoss = 0, totalGainPct = 0, totalLossPct = 0;
-
+  let totalCalls = 0, hitsPeak = 0, hitsStopLoss = 0;
   for (const rec of alertHistory.values()) {
     totalCalls++;
-    if (rec.peakPrice > rec.alertPrice) {
-      hitsPeak++;
-      totalGainPct += ((rec.peakPrice - rec.alertPrice) / rec.alertPrice) * 100;
-    }
-    if (rec.currentPrice <= (rec.alertPrice * 0.7)) {
-      hitsStopLoss++;
-      totalLossPct += 30;
-    }
+    if (rec.peakPrice > rec.alertPrice) hitsPeak++;
+    if (rec.currentPrice <= (rec.alertPrice * 0.7)) hitsStopLoss++;
   }
 
-  const neutrals = Math.max(0, totalCalls - hitsPeak - hitsStopLoss);
-  const hitRate = ((hitsPeak / totalCalls) * 100).toFixed(1);
-  const netPnl = totalGainPct - totalLossPct;
-  const avgPerTrade = (netPnl / totalCalls).toFixed(1);
-  const winRate = totalGainPct + totalLossPct > 0
-    ? ((totalGainPct / (totalGainPct + totalLossPct)) * 100).toFixed(1) : '0.0';
+  const winRate = ((hitsPeak / totalCalls) * 100).toFixed(1);
+  const slRate = ((hitsStopLoss / totalCalls) * 100).toFixed(1);
 
-  const netEmoji = netPnl >= 0 ? '🟢' : '🔴';
-  const winEmoji = parseFloat(winRate) >= 50 ? '🟢' : '🔴';
-  const avgEmoji = parseFloat(avgPerTrade) >= 0 ? '🟢' : '🔴';
-
-  await ctx.reply([
-    `📊 *Bot Performance Summary*`, ``,
-    `• *Total Tokens Called:* ${totalCalls}`,
-    `• *Pumped Above Entry:* ${hitsPeak}`,
-    `• *Hit 30% Stop Loss:* ${hitsStopLoss}`,
-    `• *Neutral \\(no move\\):* ${neutrals}`,
-    `• *Hit Rate:* ${hitsPeak}/${totalCalls} \\(${hitRate}%\\)`, ``,
-    `💹 *Net Gain:* 🟢 +${totalGainPct.toFixed(1)}%`,
-    `🔻 *Net Loss:* 🔴 \\-${totalLossPct.toFixed(1)}%`,
-    `📉 *Net PnL:* ${netEmoji} ${netPnl >= 0 ? '+' : ''}${netPnl.toFixed(1)}%`,
-    `🎯 *Avg Per Trade:* ${avgEmoji} ${parseFloat(avgPerTrade) >= 0 ? '+' : ''}${avgPerTrade}%`,
-    `📈 *Win Rate:* ${winEmoji} ${winRate}%`,
-  ].join('\n'), { parse_mode: 'Markdown' });
+  await ctx.reply(
+    `📊 *Bot Performance Summary*\n\n` +
+    `• *Total Tokens Called:* ${totalCalls}\n` +
+    `• *Pumped above entry:* ${hitsPeak} \\(${winRate}%\\)\n` +
+    `• *Hit 30% Stop Loss:* ${hitsStopLoss} \\(${slRate}%\\)\n`,
+    { parse_mode: 'Markdown' }
+  );
 });
 
 bot.action(/^pnl_(.+)$/, async (ctx) => {
   const address = ctx.match[1];
-  if (address.startsWith('period_')) return;
-
   const rec = alertHistory.get(address);
   if (!rec) return ctx.answerCbQuery('Token not found in history.');
   await ctx.answerCbQuery();
@@ -747,6 +743,7 @@ bot.action(/^pnl_(.+)$/, async (ctx) => {
 
   lines.push(``);
   lines.push(`📱 [Monitor Chart Live](https://dexscreener.com/solana/${address})`);
+
   await ctx.reply(lines.join('\n'), { parse_mode: 'Markdown' });
 });
 
