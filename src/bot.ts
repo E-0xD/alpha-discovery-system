@@ -452,18 +452,18 @@ async function scan() {
       console.log(`Reversals: ${reversalTokens.length}`);
     } catch (rErr: any) { console.log(`⚠️ Reversal scan failed: ${rErr.message}`); }
 
-    const localSeen = new Set<string>();
-    const allCandidates: any[] = [];
-    for (const p of [...newPumpTokens, ...newDexPairs, ...reversalTokens, ...pumpSwapProfiles, ...pumpProfiles]) {
-      if (!localSeen.has(p.tokenAddress)) {
-        localSeen.add(p.tokenAddress);
-        allCandidates.push(p);
-      }
-    }
+    // ── FIX 2: Prioritize WSS new tokens first before slicing to 40 ──
+    const prioritized = [
+      ...newPumpTokens,
+      ...newDexPairs,
+      ...reversalTokens,
+      ...pumpSwapProfiles,
+      ...pumpProfiles
+    ].filter((p, i, arr) => arr.findIndex(x => x.tokenAddress === p.tokenAddress) === i);
 
-    console.log(`Total candidates: ${allCandidates.length} across 5 sources`);
+    console.log(`Total candidates: ${prioritized.length} across 5 sources`);
 
-    for (const p of allCandidates.slice(0, 40)) {
+    for (const p of prioritized.slice(0, 40)) {
       try {
         await new Promise(resolve => setTimeout(resolve, 800));
         if (seenTokens.has(p.tokenAddress)) continue;
@@ -493,23 +493,27 @@ async function scan() {
         const isReversal = p.source === 'reversal';
         const mcapMin = isNew ? 500 : 1000;
 
-        if (mcap < mcapMin || mcap > 40000) { seenTokens.add(p.tokenAddress); continue; }
-// ── Number 4: Time-alive filter — skip tokens under 7 minutes old (non-WSS only) ──
-if (!isNew && pair?.pairCreatedAt) {
-  const ageMinutes = (Date.now() - pair.pairCreatedAt) / 60000;
-  if (ageMinutes < 7) {
-    console.log(`⏭ ${ticker} too young: ${ageMinutes.toFixed(1)} mins old, skipping`);
-    seenTokens.add(p.tokenAddress);
-    continue;
-  }
-}
+        // ── FIX 1: Soft skips do NOT add to seenTokens — token stays eligible for re-scan ──
+        if (mcap < mcapMin || mcap > 40000) continue;
+
+        // ── Number 4: Time-alive filter — skip tokens under 7 minutes old (non-WSS only) ──
+        if (!isNew && pair?.pairCreatedAt) {
+          const ageMinutes = (Date.now() - pair.pairCreatedAt) / 60000;
+          if (ageMinutes < 7) {
+            console.log(`⏭ ${ticker} too young: ${ageMinutes.toFixed(1)} mins old, skipping`);
+            // ── FIX 1: Soft skip — do NOT add to seenTokens ──
+            continue;
+          }
+        }
+
         const rugProb = computeRugProbability(mcap, liquidity);
         const alphaScore = computeAlphaScore(mcap, liquidity, rugProb);
         const scoreMin = isNew ? 70 : 75;
 
         console.log(`[${p.source}] ${ticker}: MCAP $${mcap} | Liq $${liquidity} | Score ${alphaScore}/100`);
 
-        if (alphaScore < scoreMin) { seenTokens.add(p.tokenAddress); continue; }
+        // ── FIX 1: Low score is a soft skip — do NOT add to seenTokens ──
+        if (alphaScore < scoreMin) continue;
 
         const signal: TokenSignal = {
           tokenAddress: address, ticker, alphaScore,
@@ -517,7 +521,8 @@ if (!isNew && pair?.pairCreatedAt) {
         };
 
         const [pattern, risk] = await Promise.all([
-          intelligence.analyzePattern(signal, creatorAddress),
+          // ── FIX 3: Pass isNew to analyzePattern so new tokens skip LOW_BUYER_VELOCITY gate ──
+          intelligence.analyzePattern(signal, creatorAddress, isNew),
           riskEngine.validateExecutionRisk(signal),
         ]);
 
