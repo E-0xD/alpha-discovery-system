@@ -1,7 +1,42 @@
 import axios from 'axios';
-import { VersionedTransaction, Keypair } from '@solana/web3.js';
+import {
+  VersionedTransaction,
+  Keypair,
+  SystemProgram,
+  PublicKey,
+  Transaction,
+  LAMPORTS_PER_SOL,
+  TransactionInstruction,
+  AccountMeta
+} from '@solana/web3.js';
 import bs58 from 'bs58';
 import * as https from 'https';
+
+// ── Official Jito tip accounts ──
+const JITO_TIP_ACCOUNTS = [
+  '96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5',
+  'HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe',
+  'Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY',
+  'ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49',
+  'DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh',
+  'ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt',
+  'DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL',
+  '3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT',
+];
+
+// ── pump.fun program constants ──
+const PUMP_FUN_PROGRAM_ID = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
+const PUMP_FUN_GLOBAL = new PublicKey('4wTV81avi27K1Wd4kFgFnntJjKvim8EWEjqjMDMFGFTX');
+const PUMP_FUN_FEE_RECIPIENT = new PublicKey('CebN5WGQ4jvEPvsVU4EoHEpgznyZKFL18NUSjCUNVDeD');
+const PUMP_FUN_EVENT_AUTHORITY = new PublicKey('Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1');
+const TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bse');
+const SYSTEM_PROGRAM_ID = new PublicKey('11111111111111111111111111111111');
+const SYSVAR_RENT = new PublicKey('SysvarRent111111111111111111111111111111111');
+
+// ── Discriminators for pump.fun buy/sell instructions ──
+const BUY_DISCRIMINATOR  = Buffer.from([102, 6, 61, 18, 1, 218, 235, 234]);
+const SELL_DISCRIMINATOR = Buffer.from([51, 230, 133, 164, 1, 127, 131, 173]);
 
 export class LowLatencyExecutionEngine {
   private jupiterUrl = process.env.QUICKNODE_JUPITER_URL || 'https://quote-api.jup.ag/v6';
@@ -28,6 +63,218 @@ export class LowLatencyExecutionEngine {
 
   public getWalletKeypair(): Keypair {
     return this.wallet;
+  }
+
+  // ── Derive bonding curve PDA for a pump.fun token ──
+  private deriveBondingCurve(mint: PublicKey): PublicKey {
+    const [pda] = PublicKey.findProgramAddressSync(
+      [Buffer.from('bonding-curve'), mint.toBuffer()],
+      PUMP_FUN_PROGRAM_ID
+    );
+    return pda;
+  }
+
+  // ── Derive associated bonding curve token account ──
+  private deriveAssociatedBondingCurve(mint: PublicKey, bondingCurve: PublicKey): PublicKey {
+    const [pda] = PublicKey.findProgramAddressSync(
+      [
+        bondingCurve.toBuffer(),
+        TOKEN_PROGRAM_ID.toBuffer(),
+        mint.toBuffer()
+      ],
+      ASSOCIATED_TOKEN_PROGRAM_ID
+    );
+    return pda;
+  }
+
+  // ── Derive user associated token account ──
+  private deriveUserTokenAccount(mint: PublicKey, owner: PublicKey): PublicKey {
+    const [pda] = PublicKey.findProgramAddressSync(
+      [
+        owner.toBuffer(),
+        TOKEN_PROGRAM_ID.toBuffer(),
+        mint.toBuffer()
+      ],
+      ASSOCIATED_TOKEN_PROGRAM_ID
+    );
+    return pda;
+  }
+
+  // ── Fetch bonding curve state to get real-time price ──
+  private async getBondingCurveState(bondingCurve: PublicKey): Promise<{
+    virtualTokenReserves: bigint;
+    virtualSolReserves: bigint;
+    realTokenReserves: bigint;
+    realSolReserves: bigint;
+    complete: boolean;
+  } | null> {
+    try {
+      const rpcUrl = process.env.QUICKNODE_RPC_URL || process.env.SOLANA_RPC_URL || '';
+      const res = await this.client.post(rpcUrl, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'getAccountInfo',
+        params: [bondingCurve.toBase58(), { encoding: 'base64' }]
+      }, { timeout: 5000 });
+
+      const data = res.data?.result?.value?.data?.[0];
+      if (!data) return null;
+
+      const buf = Buffer.from(data, 'base64');
+      // Skip 8-byte discriminator
+      // Layout: virtualTokenReserves (u64), virtualSolReserves (u64),
+      //         realTokenReserves (u64), realSolReserves (u64),
+      //         tokenTotalSupply (u64), complete (bool)
+      if (buf.length < 49) return null;
+      const virtualTokenReserves = buf.readBigUInt64LE(8);
+      const virtualSolReserves   = buf.readBigUInt64LE(16);
+      const realTokenReserves    = buf.readBigUInt64LE(24);
+      const realSolReserves      = buf.readBigUInt64LE(32);
+      const complete             = buf.readUInt8(48) === 1;
+
+      return { virtualTokenReserves, virtualSolReserves, realTokenReserves, realSolReserves, complete };
+    } catch {
+      return null;
+    }
+  }
+
+  // ── Calculate tokens out for a given SOL input using bonding curve formula ──
+  private calcTokensOut(solAmountLamports: bigint, state: {
+    virtualTokenReserves: bigint;
+    virtualSolReserves: bigint;
+  }): bigint {
+    // pump.fun uses constant product: x * y = k
+    // tokens_out = (token_reserves * sol_in) / (sol_reserves + sol_in)
+    const numerator   = state.virtualTokenReserves * solAmountLamports;
+    const denominator = state.virtualSolReserves + solAmountLamports;
+    return numerator / denominator;
+  }
+
+  // ── Build direct pump.fun buy instruction ──
+  private buildPumpBuyInstruction(
+    mint: PublicKey,
+    bondingCurve: PublicKey,
+    associatedBondingCurve: PublicKey,
+    userTokenAccount: PublicKey,
+    tokenAmount: bigint,
+    maxSolLamports: bigint
+  ): TransactionInstruction {
+    // Instruction data: discriminator (8) + tokenAmount (u64 LE) + maxSolCost (u64 LE)
+    const data = Buffer.alloc(24);
+    BUY_DISCRIMINATOR.copy(data, 0);
+    data.writeBigUInt64LE(tokenAmount, 8);
+    data.writeBigUInt64LE(maxSolLamports, 16);
+
+    const keys: AccountMeta[] = [
+      { pubkey: PUMP_FUN_GLOBAL,              isSigner: false, isWritable: false },
+      { pubkey: PUMP_FUN_FEE_RECIPIENT,       isSigner: false, isWritable: true  },
+      { pubkey: mint,                         isSigner: false, isWritable: false },
+      { pubkey: bondingCurve,                 isSigner: false, isWritable: true  },
+      { pubkey: associatedBondingCurve,       isSigner: false, isWritable: true  },
+      { pubkey: userTokenAccount,             isSigner: false, isWritable: true  },
+      { pubkey: this.wallet.publicKey,        isSigner: true,  isWritable: true  },
+      { pubkey: SYSTEM_PROGRAM_ID,            isSigner: false, isWritable: false },
+      { pubkey: TOKEN_PROGRAM_ID,             isSigner: false, isWritable: false },
+      { pubkey: SYSVAR_RENT,                  isSigner: false, isWritable: false },
+      { pubkey: PUMP_FUN_EVENT_AUTHORITY,     isSigner: false, isWritable: false },
+      { pubkey: PUMP_FUN_PROGRAM_ID,          isSigner: false, isWritable: false },
+    ];
+
+    return new TransactionInstruction({ programId: PUMP_FUN_PROGRAM_ID, keys, data });
+  }
+
+  // ── Build direct pump.fun sell instruction ──
+  private buildPumpSellInstruction(
+    mint: PublicKey,
+    bondingCurve: PublicKey,
+    associatedBondingCurve: PublicKey,
+    userTokenAccount: PublicKey,
+    tokenAmount: bigint,
+    minSolOutput: bigint
+  ): TransactionInstruction {
+    // Instruction data: discriminator (8) + tokenAmount (u64 LE) + minSolOutput (u64 LE)
+    const data = Buffer.alloc(24);
+    SELL_DISCRIMINATOR.copy(data, 0);
+    data.writeBigUInt64LE(tokenAmount, 8);
+    data.writeBigUInt64LE(minSolOutput, 16);
+
+    const keys: AccountMeta[] = [
+      { pubkey: PUMP_FUN_GLOBAL,              isSigner: false, isWritable: false },
+      { pubkey: PUMP_FUN_FEE_RECIPIENT,       isSigner: false, isWritable: true  },
+      { pubkey: mint,                         isSigner: false, isWritable: false },
+      { pubkey: bondingCurve,                 isSigner: false, isWritable: true  },
+      { pubkey: associatedBondingCurve,       isSigner: false, isWritable: true  },
+      { pubkey: userTokenAccount,             isSigner: false, isWritable: true  },
+      { pubkey: this.wallet.publicKey,        isSigner: true,  isWritable: true  },
+      { pubkey: SYSTEM_PROGRAM_ID,            isSigner: false, isWritable: false },
+      { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID,  isSigner: false, isWritable: false },
+      { pubkey: TOKEN_PROGRAM_ID,             isSigner: false, isWritable: false },
+      { pubkey: PUMP_FUN_EVENT_AUTHORITY,     isSigner: false, isWritable: false },
+      { pubkey: PUMP_FUN_PROGRAM_ID,          isSigner: false, isWritable: false },
+    ];
+
+    return new TransactionInstruction({ programId: PUMP_FUN_PROGRAM_ID, keys, data });
+  }
+
+  // ── Build pump.fun direct swap transaction (pre-graduation) ──
+  public async buildPumpFunSwapTransaction(
+    tokenAddress: string,
+    solAmount: number,
+    direction: 'BUY' | 'SELL'
+  ): Promise<VersionedTransaction> {
+    const mint = new PublicKey(tokenAddress);
+    const bondingCurve = this.deriveBondingCurve(mint);
+    const associatedBondingCurve = this.deriveAssociatedBondingCurve(mint, bondingCurve);
+    const userTokenAccount = this.deriveUserTokenAccount(mint, this.wallet.publicKey);
+
+    const solLamports = BigInt(Math.floor(solAmount * LAMPORTS_PER_SOL));
+
+    // ── Fetch bonding curve state for price calculation ──
+    const state = await this.getBondingCurveState(bondingCurve);
+    if (!state) throw new Error('Could not fetch bonding curve state');
+    if (state.complete) throw new Error('Token already graduated to Raydium — use Jupiter');
+
+    const rpcUrl = process.env.QUICKNODE_RPC_URL || process.env.SOLANA_RPC_URL || '';
+    const blockhashRes = await this.client.post(rpcUrl, {
+      jsonrpc: '2.0', id: 1,
+      method: 'getLatestBlockhash',
+      params: [{ commitment: 'confirmed' }]
+    }, { timeout: 5000 });
+    const blockhash = blockhashRes.data?.result?.value?.blockhash;
+    if (!blockhash) throw new Error('Could not fetch blockhash');
+
+    const tx = new Transaction();
+    tx.recentBlockhash = blockhash;
+    tx.feePayer = this.wallet.publicKey;
+
+    if (direction === 'BUY') {
+      // 25% slippage buffer for fast-moving tokens
+      const tokensOut = this.calcTokensOut(solLamports, state);
+      const minTokensWithSlippage = (tokensOut * 75n) / 100n;
+      const maxSolWithSlippage = (solLamports * 125n) / 100n;
+
+      tx.add(this.buildPumpBuyInstruction(
+        mint, bondingCurve, associatedBondingCurve, userTokenAccount,
+        minTokensWithSlippage, maxSolWithSlippage
+      ));
+    } else {
+      // For sell: token amount comes in as solAmount param (reused as token units)
+      const tokenLamports = BigInt(Math.floor(solAmount * 1_000_000));
+      // Minimum SOL out with 25% slippage
+      const solOut = (state.virtualSolReserves * tokenLamports) / (state.virtualTokenReserves + tokenLamports);
+      const minSolOut = (solOut * 75n) / 100n;
+
+      tx.add(this.buildPumpSellInstruction(
+        mint, bondingCurve, associatedBondingCurve, userTokenAccount,
+        tokenLamports, minSolOut
+      ));
+    }
+
+    tx.sign(this.wallet);
+
+    // ── Convert legacy Transaction to VersionedTransaction for unified dispatch ──
+    const serialized = tx.serialize();
+    return VersionedTransaction.deserialize(serialized);
   }
 
   public async buildJupiterSwapTransaction(outputMint: string, solAmount: number, direction: 'BUY' | 'SELL'): Promise<VersionedTransaction> {
@@ -64,11 +311,78 @@ export class LowLatencyExecutionEngine {
     return VersionedTransaction.deserialize(swapBuffer);
   }
 
+  // ── Build a legacy tip transaction to one random Jito tip account ──
+  // ── Uses the same blockhash as the swap tx to satisfy Jito bundle requirements ──
+  private buildJitoTipTransaction(tipLamports: number, blockhash: string): Transaction {
+    // Pick a random tip account to distribute load
+    const tipAccount = new PublicKey(
+      JITO_TIP_ACCOUNTS[Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length)]
+    );
+
+    const tipTx = new Transaction();
+    tipTx.recentBlockhash = blockhash;
+    tipTx.feePayer = this.wallet.publicKey;
+    tipTx.add(
+      SystemProgram.transfer({
+        fromPubkey: this.wallet.publicKey,
+        toPubkey: tipAccount,
+        lamports: tipLamports,
+      })
+    );
+
+    tipTx.sign(this.wallet);
+    return tipTx;
+  }
+
   public async dispatchMevProtectedBundle(tx: VersionedTransaction): Promise<{ success: boolean; bundleId?: string; error?: string }> {
-    // ✅ Skip Jito — requires tip account write lock which Jupiter txs don't include
-    // Direct RPC is faster and more reliable for our use case
-    console.log('📤 Sending via direct RPC...');
-    return this.fallbackToQuickNode(tx.serialize());
+    try {
+      // ── Tip amount: 0.001 SOL ──
+      const TIP_LAMPORTS = Math.floor(0.001 * LAMPORTS_PER_SOL);
+
+      // ── Extract blockhash from swap tx so both txs share the same one ──
+      const swapBlockhash = tx.message.recentBlockhash;
+      console.log('🎯 Building Jito tip transaction...');
+      const tipTx = this.buildJitoTipTransaction(TIP_LAMPORTS, swapBlockhash);
+
+      // ── Encode both transactions: tip first, swap second ──
+      const tipEncoded  = Buffer.from(tipTx.serialize()).toString('base64');
+      const swapEncoded = Buffer.from(tx.serialize()).toString('base64');
+
+      console.log('📤 Sending Jito bundle (tip + swap)...');
+      const res = await this.client.post(
+        this.jitoBundleEndpoint,
+        {
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'sendBundle',
+          params: [[tipEncoded, swapEncoded]]
+        },
+        { timeout: 10000 }
+      );
+
+      if (res.data?.result) {
+        const bundleId = res.data.result;
+        console.log(`📦 Jito bundle sent: ${bundleId}`);
+
+        // ── Confirm bundle in background — scan continues immediately ──
+        this.confirmJitoBundle(bundleId).then(confirmed => {
+          if (confirmed) console.log(`✅ Jito bundle confirmed: ${bundleId}`);
+          else console.log(`⚠️ Jito bundle unconfirmed after 30s — check manually: ${bundleId}`);
+        });
+
+        return { success: true, bundleId };
+      }
+
+      // ── Jito rejected — fall back to direct RPC ──
+      const jitoError = res.data?.error?.message || 'Jito rejected bundle';
+      console.log(`⚠️ Jito rejected, falling back to direct RPC: ${jitoError}`);
+      return this.fallbackToQuickNode(tx.serialize());
+
+    } catch (e: any) {
+      // ── Network error — fall back to direct RPC ──
+      console.log(`⚠️ Jito unreachable, falling back to direct RPC: ${e.message}`);
+      return this.fallbackToQuickNode(tx.serialize());
+    }
   }
 
   // ✅ Jito bundle confirmation — kept for future use if Jito tip is added
