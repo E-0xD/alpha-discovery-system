@@ -140,6 +140,80 @@ async function saveHistory() {
   }
 }
 
+// ── Trade logging helpers ──
+async function logTradeAlert(params: {
+  address: string; ticker: string; source: string;
+  alertPrice: number; alertMcap: number; entryPrice: number; entrySizeSol: number;
+  alphaScore: number; rugProbability: number; uniqueBuyers: number;
+  buyerVelocity: string; topHolderPct: number; isBundledLaunch: boolean;
+  washTrading: boolean; smartMoney: boolean;
+}) {
+  try {
+    await db.query(`
+      INSERT INTO trades_log (
+        address, ticker, source, alert_time, alert_price, alert_mcap,
+        entry_price, entry_size_sol, peak_price, peak_mcap,
+        alpha_score, rug_probability, unique_buyers, buyer_velocity,
+        top_holder_pct, is_bundled_launch, wash_trading, smart_money, status
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,'OPEN')
+      ON CONFLICT DO NOTHING
+    `, [
+      params.address, params.ticker, params.source, Date.now(),
+      params.alertPrice, params.alertMcap,
+      params.entryPrice > 0 ? params.entryPrice : null,
+      params.entrySizeSol > 0 ? params.entrySizeSol : null,
+      params.alertPrice, params.alertMcap,
+      params.alphaScore, params.rugProbability,
+      params.uniqueBuyers, params.buyerVelocity,
+      params.topHolderPct, params.isBundledLaunch,
+      params.washTrading, params.smartMoney
+    ]);
+  } catch (e: any) {
+    console.log(`⚠️ Trade log insert failed: ${e.message}`);
+  }
+}
+
+async function updateTradePeak(address: string, peakPrice: number, peakMcap: number) {
+  try {
+    await db.query(`
+      UPDATE trades_log SET
+        peak_price = GREATEST(COALESCE(peak_price, 0), $2),
+        peak_mcap  = GREATEST(COALESCE(peak_mcap, 0), $3),
+        peak_time  = CASE WHEN $2 > COALESCE(peak_price, 0) THEN $4 ELSE peak_time END,
+        peak_gain_pct = CASE WHEN alert_price > 0
+          THEN ROUND((($2 - alert_price) / alert_price * 100)::numeric, 2)
+          ELSE peak_gain_pct END
+      WHERE address = $1 AND status = 'OPEN'
+    `, [address, peakPrice, peakMcap, Date.now()]);
+  } catch (e: any) {
+    console.log(`⚠️ Trade peak update failed: ${e.message}`);
+  }
+}
+
+async function closeTrade(address: string, exitPrice: number, exitType: string, sizeSol: number) {
+  try {
+    await db.query(`
+      UPDATE trades_log SET
+        exit_price    = $2,
+        exit_time     = $3,
+        exit_type     = $4,
+        status        = 'CLOSED',
+        pnl_pct       = CASE WHEN entry_price > 0
+                          THEN ROUND((($2 - entry_price) / entry_price * 100)::numeric, 2)
+                          ELSE NULL END,
+        pnl_sol       = CASE WHEN entry_price > 0
+                          THEN ROUND((($2 - entry_price) / entry_price * $5)::numeric, 6)
+                          ELSE NULL END,
+        held_minutes  = CASE WHEN alert_time > 0
+                          THEN FLOOR(($3 - alert_time) / 60000)
+                          ELSE NULL END
+      WHERE address = $1 AND status = 'OPEN'
+    `, [address, exitPrice, Date.now(), exitType, sizeSol]);
+  } catch (e: any) {
+    console.log(`⚠️ Trade close failed: ${e.message}`);
+  }
+}
+
 function escapeText(text: string): string {
   return String(text).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
 }
@@ -280,6 +354,8 @@ async function monitorPositions() {
           updated.peakMcap = currentMcap;
           updated.peakTime = now;
           console.log(`📈 New peak ${rec.ticker}: $${currentPrice.toFixed(8)} (+${(((currentPrice - rec.alertPrice) / rec.alertPrice) * 100).toFixed(1)}%)`);
+          // ── Update trade log peak ──
+          await updateTradePeak(address, currentPrice, currentMcap);
         }
         alertHistory.set(address, updated);
       }
@@ -319,22 +395,27 @@ async function monitorPositions() {
         // 60% at +100%, 15% at +250%, 15% at +500%, 10% at +900%
         let tpMsg = '';
         let soldPct = 0;
+        let tpLabel = '';
 
         if (pnlPct >= 100 && updated.remainingPct > 40) {
           soldPct = 60;
           updated.remainingPct = 40;
+          tpLabel = 'TP1_100PCT';
           tpMsg = `🎯 *TAKE PROFIT 1 — +100%*\n• Sold: 60% of position\n• Remaining: 40%\n• Next TP: +250%`;
         } else if (pnlPct >= 250 && updated.remainingPct > 25) {
           soldPct = 15;
           updated.remainingPct = 25;
+          tpLabel = 'TP2_250PCT';
           tpMsg = `🎯 *TAKE PROFIT 2 — +250%*\n• Sold: 15% of position\n• Remaining: 25%\n• Next TP: +500%`;
         } else if (pnlPct >= 500 && updated.remainingPct > 10) {
           soldPct = 15;
           updated.remainingPct = 10;
+          tpLabel = 'TP3_500PCT';
           tpMsg = `🎯 *TAKE PROFIT 3 — +500%*\n• Sold: 15% of position\n• Remaining: 10%\n• Next TP: +900%`;
         } else if (pnlPct >= 900 && updated.remainingPct > 0) {
           soldPct = 10;
           updated.remainingPct = 0;
+          tpLabel = 'TP4_900PCT';
           tpMsg = `🎯 *TAKE PROFIT 4 — +900%*\n• Sold: final 10% of position\n• Position fully closed`;
         }
 
@@ -350,8 +431,9 @@ async function monitorPositions() {
           ].join('\n');
           await bot.telegram.sendMessage(CHAT_ID, fullMsg, { parse_mode: 'Markdown' });
 
-          // If fully exited
+          // If fully exited — log close
           if (updated.remainingPct === 0) {
+            await closeTrade(address, currentPrice, tpLabel, pos.sizeSol);
             openPositions.delete(address);
             console.log(`✅ Position fully closed: ${pos.ticker} at +${pnlPct.toFixed(1)}%`);
             openPositions.set(address, updated);
@@ -369,6 +451,9 @@ async function monitorPositions() {
             updated.stopLossLevel === 'trailing' ? '🔐 TRAILING STOP — +2% Above Entry' :
             updated.stopLossLevel === 'breakeven' ? '🔒 DYNAMIC STOP — -10% Below Entry' :
             '🛑 STOP LOSS — -20% Hit';
+          const exitType =
+            updated.stopLossLevel === 'trailing' ? 'TRAILING_STOP' :
+            updated.stopLossLevel === 'breakeven' ? 'DYNAMIC_STOP' : 'STOP_LOSS';
 
           const msg = [
             `💰 *POSITION CLOSED*`, ``,
@@ -383,6 +468,8 @@ async function monitorPositions() {
             stopLabel,
           ].join('\n');
           await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
+          // ── Log trade close ──
+          await closeTrade(address, currentPrice, exitType, pos.sizeSol);
           openPositions.delete(address);
           console.log(`✅ Closed via stop loss: ${pos.ticker} ${pnlPct.toFixed(1)}%`);
           return;
@@ -541,8 +628,25 @@ async function scan() {
 
         if (risk.allow) {
           try {
-            const tx = await executor.buildJupiterSwapTransaction(address, risk.sizeSol, 'BUY');
-            tx.sign([executor.getWalletKeypair()]);
+            // ── Use direct pump.fun bonding curve for pre-graduation tokens ──
+            // ── Fall back to Jupiter for graduated/Raydium tokens ──
+            let tx;
+            const isPumpPreGrad = address.endsWith('pump');
+            if (isPumpPreGrad) {
+              try {
+                tx = await executor.buildPumpFunSwapTransaction(address, risk.sizeSol, 'BUY');
+                console.log(`⚡ Using direct pump.fun bonding curve for ${ticker}`);
+              } catch (pumpErr: any) {
+                // If bonding curve call fails (e.g. already graduated), fall back to Jupiter
+                console.log(`⚠️ Pump.fun direct failed (${pumpErr.message}), falling back to Jupiter`);
+                tx = await executor.buildJupiterSwapTransaction(address, risk.sizeSol, 'BUY');
+                tx.sign([executor.getWalletKeypair()]);
+              }
+            } else {
+              tx = await executor.buildJupiterSwapTransaction(address, risk.sizeSol, 'BUY');
+              tx.sign([executor.getWalletKeypair()]);
+            }
+
             const result = await executor.dispatchMevProtectedBundle(tx);
             if (result.success) {
               const txLink = result.bundleId ? ` — [Solscan](https://solscan.io/tx/${result.bundleId})` : '';
@@ -556,7 +660,7 @@ async function scan() {
                   peakPrice: executedPrice,
                   sizeSol: executedSizeSol,
                   entryTime: Date.now(),
-                  // ── Start with initial stop loss at -30% ──
+                  // ── Start with initial stop loss at -20% ──
                   stopLossLevel: 'initial',
                   stopLossPct: -20,
                   remainingPct: 100,
@@ -592,6 +696,20 @@ async function scan() {
             lastUpdated: Date.now()
           });
           await saveHistory();
+
+          // ── Log to trades_log ──
+          await logTradeAlert({
+            address, ticker, source: p.source,
+            alertPrice: currentPrice, alertMcap: mcap,
+            entryPrice: executedPrice, entrySizeSol: executedSizeSol,
+            alphaScore, rugProbability: rugProb,
+            uniqueBuyers: pattern.uniqueBuyers,
+            buyerVelocity: pattern.buyerVelocity,
+            topHolderPct: pattern.topHolderConcentration,
+            isBundledLaunch: pattern.isBundledLaunch,
+            washTrading: pattern.washTradingDetected,
+            smartMoney: pattern.smartCohortPresence,
+          });
         }
 
         const walletShort = `${executor.getWalletPublicKey().slice(0, 8)}...${executor.getWalletPublicKey().slice(-4)}`;
@@ -751,13 +869,21 @@ function getPeriodDateString(period: string): string {
 
 async function buildPeriodPnlMessage(period: string): Promise<{ text: string; buttons: any[] }> {
   const now = Date.now();
-  const periodMs: Record<string, number> = {
-    daily: 24 * 60 * 60 * 1000,
-    weekly: 7 * 24 * 60 * 60 * 1000,
-    monthly: 30 * 24 * 60 * 60 * 1000,
-    lifetime: Infinity
-  };
-  const cutoff = period === 'lifetime' ? 0 : now - periodMs[period];
+
+  // ── FIX: daily uses calendar day from midnight UTC, not rolling 24h ──
+  let cutoff: number;
+  if (period === 'daily') {
+    const todayUTC = new Date();
+    todayUTC.setUTCHours(0, 0, 0, 0);
+    cutoff = todayUTC.getTime();
+  } else if (period === 'weekly') {
+    cutoff = now - 7 * 24 * 60 * 60 * 1000;
+  } else if (period === 'monthly') {
+    cutoff = now - 30 * 24 * 60 * 60 * 1000;
+  } else {
+    cutoff = 0; // lifetime
+  }
+
   const filtered = Array.from(alertHistory.entries())
     .filter(([, rec]) => rec.alertTime >= cutoff)
     .sort((a, b) => b[1].alertTime - a[1].alertTime)
@@ -958,6 +1084,133 @@ bot.action(/^refresh_pnl_(.+)$/, async (ctx) => {
     parse_mode: 'Markdown',
     ...Markup.inlineKeyboard(result.buttons)
   });
+});
+
+// ── /report — sends CSV of all trades for selected period to Telegram ──
+bot.command('report', async (ctx) => {
+  await ctx.reply(
+    '📊 *Select report period:*',
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('📅 Daily', 'report_daily')],
+        [Markup.button.callback('📆 Weekly', 'report_weekly')],
+        [Markup.button.callback('🗓 Monthly', 'report_monthly')],
+        [Markup.button.callback('🏆 Lifetime', 'report_lifetime')],
+      ])
+    }
+  );
+});
+
+bot.action(/^report_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery('Generating report...');
+  const period = ctx.match[1];
+
+  let cutoff: number;
+  const now = Date.now();
+  if (period === 'daily') {
+    const todayUTC = new Date();
+    todayUTC.setUTCHours(0, 0, 0, 0);
+    cutoff = todayUTC.getTime();
+  } else if (period === 'weekly') {
+    cutoff = now - 7 * 24 * 60 * 60 * 1000;
+  } else if (period === 'monthly') {
+    cutoff = now - 30 * 24 * 60 * 60 * 1000;
+  } else {
+    cutoff = 0;
+  }
+
+  try {
+    const result = await db.query(`
+      SELECT
+        ticker, address, source,
+        to_timestamp(alert_time / 1000) AT TIME ZONE 'UTC' AS alert_time,
+        alert_price, alert_mcap,
+        entry_price, entry_size_sol,
+        peak_price, peak_mcap,
+        to_timestamp(peak_time / 1000) AT TIME ZONE 'UTC' AS peak_time,
+        peak_gain_pct,
+        exit_price,
+        to_timestamp(exit_time / 1000) AT TIME ZONE 'UTC' AS exit_time,
+        exit_type, pnl_pct, pnl_sol, held_minutes,
+        alpha_score, rug_probability,
+        unique_buyers, buyer_velocity, top_holder_pct,
+        is_bundled_launch, wash_trading, smart_money, status
+      FROM trades_log
+      WHERE alert_time >= $1
+      ORDER BY alert_time DESC
+    `, [cutoff]);
+
+    if (result.rows.length === 0) {
+      await ctx.reply('📭 No trades found for this period.');
+      return;
+    }
+
+    // ── Build CSV ──
+    const headers = [
+      'Ticker','Address','Source','Alert Time (UTC)','Alert Price','Alert MCAP',
+      'Entry Price','Entry Size (SOL)','Peak Price','Peak MCAP','Peak Time (UTC)',
+      'Peak Gain %','Exit Price','Exit Time (UTC)','Exit Type',
+      'PnL %','PnL SOL','Held (mins)',
+      'Alpha Score','Rug Prob','Unique Buyers','Buyer Velocity','Top Holder %',
+      'Bundled Launch','Wash Trading','Smart Money','Status'
+    ];
+
+    const csvRows = result.rows.map(r => [
+      r.ticker, r.address, r.source,
+      r.alert_time ? new Date(r.alert_time).toISOString() : '',
+      r.alert_price ?? '', r.alert_mcap ?? '',
+      r.entry_price ?? '', r.entry_size_sol ?? '',
+      r.peak_price ?? '', r.peak_mcap ?? '',
+      r.peak_time ? new Date(r.peak_time).toISOString() : '',
+      r.peak_gain_pct ?? '',
+      r.exit_price ?? '',
+      r.exit_time ? new Date(r.exit_time).toISOString() : '',
+      r.exit_type ?? '', r.pnl_pct ?? '', r.pnl_sol ?? '', r.held_minutes ?? '',
+      r.alpha_score ?? '', r.rug_probability ?? '',
+      r.unique_buyers ?? '', r.buyer_velocity ?? '', r.top_holder_pct ?? '',
+      r.is_bundled_launch, r.wash_trading, r.smart_money, r.status
+    ].map(v => `"${String(v).replace(/"/g, '""')}"`).join(','));
+
+    const csv = [headers.join(','), ...csvRows].join('\n');
+    const csvBuffer = Buffer.from(csv, 'utf-8');
+
+    // ── Winrate summary ──
+    const closed = result.rows.filter(r => r.status === 'CLOSED' && r.pnl_pct != null);
+    const wins = closed.filter(r => parseFloat(r.pnl_pct) > 0);
+    const losses = closed.filter(r => parseFloat(r.pnl_pct) <= 0);
+    const totalPnlPct = closed.reduce((s, r) => s + parseFloat(r.pnl_pct || '0'), 0);
+    const totalPnlSol = closed.reduce((s, r) => s + parseFloat(r.pnl_sol || '0'), 0);
+    const winRate = closed.length > 0 ? ((wins.length / closed.length) * 100).toFixed(1) : '0.0';
+    const periodLabel: Record<string, string> = {
+      daily: 'Daily', weekly: 'Weekly', monthly: 'Monthly', lifetime: 'Lifetime'
+    };
+
+    const summary = [
+      `📊 *${periodLabel[period]} Trade Report*`, ``,
+      `• *Total Alerts:* ${result.rows.length}`,
+      `• *Closed Trades:* ${closed.length}`,
+      `• *Wins:* ${wins.length} | *Losses:* ${losses.length}`,
+      `• *Win Rate:* ${parseFloat(winRate) >= 50 ? '🟢' : '🔴'} ${winRate}%`,
+      `• *Total PnL %:* ${totalPnlPct >= 0 ? '🟢 +' : '🔴 '}${totalPnlPct.toFixed(2)}%`,
+      `• *Total PnL SOL:* ${totalPnlSol >= 0 ? '🟢 +' : '🔴 '}${totalPnlSol.toFixed(4)} SOL`,
+      ``,
+      `📎 Full CSV attached below`,
+    ].join('\n');
+
+    await ctx.reply(summary, { parse_mode: 'Markdown' });
+
+    // ── Send CSV as document ──
+    const filename = `trades_${period}_${new Date().toISOString().slice(0, 10)}.csv`;
+    await bot.telegram.sendDocument(CHAT_ID, {
+      source: csvBuffer,
+      filename
+    }, { caption: `${periodLabel[period]} trades export — ${result.rows.length} records` });
+
+  } catch (e: any) {
+    console.log(`❌ Report error: ${e.message}`);
+    await ctx.reply('❌ Report generation failed. Check logs.');
+  }
 });
 
 // ✅ Heartbeat — console only, NOT Telegram
