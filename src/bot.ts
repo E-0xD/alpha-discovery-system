@@ -21,7 +21,7 @@ bot.use(async (ctx, next) => {
   const chatId = ctx.chat?.id?.toString();
   if (chatId !== CHAT_ID) {
     console.log(`🚫 Unauthorized access attempt from chat: ${chatId}`);
-    return;
+    return; // silently ignore — don't respond at all
   }
   return next();
 });
@@ -32,25 +32,8 @@ const executor = new LowLatencyExecutionEngine();
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const DOMAIN = process.env.RENDER_EXTERNAL_URL || 'https://alpha-discovery-system.onrender.com';
 
+const seenTokens = new Set<string>();
 const wssPumpTokensQueue: any[] = [];
-
-// ── seenTokens with 30-minute expiry instead of clearing at 500 ──
-const seenTokens = new Map<string, number>(); // address → timestamp seen
-const SEEN_EXPIRY_MS = 30 * 60 * 1000; // 30 minutes
-
-function hasSeenToken(address: string): boolean {
-  const seenAt = seenTokens.get(address);
-  if (!seenAt) return false;
-  if (Date.now() - seenAt > SEEN_EXPIRY_MS) {
-    seenTokens.delete(address);
-    return false;
-  }
-  return true;
-}
-
-function markTokenSeen(address: string) {
-  seenTokens.set(address, Date.now());
-}
 
 interface Position {
   ticker: string;
@@ -59,12 +42,10 @@ interface Position {
   peakPrice: number;
   sizeSol: number;
   entryTime: number;
-  // ── Tiered exit state ──
-  // initial = never hit +30%, stop loss at -20% below entry
-  // level2  = hit +30% but not +70%, stop loss tightened to -15% below entry
-  stopLossLevel: 'initial' | 'level2';
-  stopLossPct: number;
-  remainingPct: number;
+  // ── Dynamic trailing stop loss state ──
+  stopLossLevel: 'initial' | 'breakeven' | 'trailing';
+  stopLossPct: number; // current stop loss % relative to entry (negative = below entry)
+  remainingPct: number; // remaining position size (starts at 100)
 }
 const openPositions = new Map<string, Position>();
 
@@ -95,6 +76,8 @@ async function loadHistory() {
   } catch (e) {
     console.log('⚠️ Redis load failed, trying Supabase...');
   }
+
+  // ✅ Supabase fallback
   try {
     const result = await db.query(`
       SELECT address, ticker, alert_time, alert_mcap, alert_price,
@@ -124,11 +107,14 @@ async function loadHistory() {
 
 // ✅ Save to both Redis and Supabase
 async function saveHistory() {
+  // Redis save
   try {
     await redis.set('bot_history', JSON.stringify(Array.from(alertHistory.entries())));
   } catch (e: any) {
     console.log(`⚠️ Redis save failed: ${e.message}`);
   }
+
+  // Supabase save — upsert so peaks update but alertTime never changes
   try {
     for (const rec of alertHistory.values()) {
       await db.query(`
@@ -154,81 +140,6 @@ async function saveHistory() {
   }
 }
 
-// ── Trade logging helpers ──
-async function logTradeAlert(params: {
-  address: string; ticker: string; source: string;
-  alertPrice: number; alertMcap: number; entryPrice: number; entrySizeSol: number;
-  alphaScore: number; rugProbability: number; uniqueBuyers: number;
-  buyerVelocity: string; topHolderPct: number; isBundledLaunch: boolean;
-  washTrading: boolean; smartMoney: boolean; status: string;
-}) {
-  try {
-    await db.query(`
-      INSERT INTO trades_log (
-        address, ticker, source, alert_time, alert_price, alert_mcap,
-        entry_price, entry_size_sol, peak_price, peak_mcap,
-        alpha_score, rug_probability, unique_buyers, buyer_velocity,
-        top_holder_pct, is_bundled_launch, wash_trading, smart_money, status
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
-      ON CONFLICT DO NOTHING
-    `, [
-      params.address, params.ticker, params.source, Date.now(),
-      params.alertPrice, params.alertMcap,
-      params.entryPrice > 0 ? params.entryPrice : null,
-      params.entrySizeSol > 0 ? params.entrySizeSol : null,
-      params.alertPrice, params.alertMcap,
-      params.alphaScore, params.rugProbability,
-      params.uniqueBuyers, params.buyerVelocity,
-      params.topHolderPct, params.isBundledLaunch,
-      params.washTrading, params.smartMoney,
-      params.status
-    ]);
-  } catch (e: any) {
-    console.log(`⚠️ Trade log insert failed: ${e.message}`);
-  }
-}
-
-async function updateTradePeak(address: string, peakPrice: number, peakMcap: number) {
-  try {
-    await db.query(`
-      UPDATE trades_log SET
-        peak_price = GREATEST(COALESCE(peak_price, 0), $2),
-        peak_mcap  = GREATEST(COALESCE(peak_mcap, 0), $3),
-        peak_time  = CASE WHEN $2 > COALESCE(peak_price, 0) THEN $4 ELSE peak_time END,
-        peak_gain_pct = CASE WHEN alert_price > 0
-          THEN ROUND((($2 - alert_price) / alert_price * 100)::numeric, 2)
-          ELSE peak_gain_pct END
-      WHERE address = $1 AND status = 'OPEN'
-    `, [address, peakPrice, peakMcap, Date.now()]);
-  } catch (e: any) {
-    console.log(`⚠️ Trade peak update failed: ${e.message}`);
-  }
-}
-
-async function closeTrade(address: string, exitPrice: number, exitType: string, sizeSol: number) {
-  try {
-    await db.query(`
-      UPDATE trades_log SET
-        exit_price    = $2,
-        exit_time     = $3,
-        exit_type     = $4,
-        status        = 'CLOSED',
-        pnl_pct       = CASE WHEN entry_price > 0
-                          THEN ROUND((($2 - entry_price) / entry_price * 100)::numeric, 2)
-                          ELSE NULL END,
-        pnl_sol       = CASE WHEN entry_price > 0
-                          THEN ROUND((($2 - entry_price) / entry_price * $5)::numeric, 6)
-                          ELSE NULL END,
-        held_minutes  = CASE WHEN alert_time > 0
-                          THEN FLOOR(($3 - alert_time) / 60000)
-                          ELSE NULL END
-      WHERE address = $1 AND status = 'OPEN'
-    `, [address, exitPrice, Date.now(), exitType, sizeSol]);
-  } catch (e: any) {
-    console.log(`⚠️ Trade close failed: ${e.message}`);
-  }
-}
-
 function escapeText(text: string): string {
   return String(text).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
 }
@@ -246,13 +157,13 @@ function computeAlphaScore(mcap: number, liquidity: number, rugProb: number): nu
   else if (ratio >= 0.20) score += 30;
   else if (ratio >= 0.10) score += 20;
   else if (ratio >= 0.05) score += 10;
-  if (mcap >= 1000 && mcap <= 28000) score += 25;
+  if (mcap >= 1000 && mcap <= 40000) score += 25;
   if (liquidity >= 25000) score += 20;
   else if (liquidity >= 10000) score += 12;
   else if (liquidity >= 5000) score += 6;
   if (rugProb <= 0.10) score += 15;
-  else if (rugProb <= 0.15) score += 8;
-  else if (rugProb >= 0.20) score -= 10;
+  else if (rugProb <= 0.20) score += 8;
+  else if (rugProb >= 0.30) score -= 10;
   return Math.min(100, Math.max(0, score));
 }
 
@@ -270,51 +181,12 @@ function isReversalCandidate(pair: any): boolean {
   const h6 = parseFloat(pair.priceChange?.h6 || '0');
   const h1 = parseFloat(pair.priceChange?.h1 || '0');
   const volH24 = parseFloat(pair.volume?.h24 || '0');
-  const volH1 = parseFloat(pair.volume?.h1 || '0');
-  const liq = parseFloat(pair.liquidity?.usd || '0');
-  // Must have dumped hard (>=50%), be recovering (h1 >= +8%), volume returning strongly
-  const dumpedHard = h24 <= -50;
-  const recoveringH1 = h1 >= 8;
-  const recoveringH6 = h6 >= 15;
-  // Volume in last hour must be at least 40% of total 24h volume — confirms real buying
-  const volumeReturning = volH24 > 0 && volH1 > 0 && (volH1 / volH24) > 0.40;
-  // Must have real liquidity
-  const hasRealLiquidity = liq >= 8000;
-  return dumpedHard && (recoveringH1 || recoveringH6) && volumeReturning && hasRealLiquidity;
-}
-
-function isPostBondCandidate(pair: any): boolean {
-  const h24 = parseFloat(pair.priceChange?.h24 || '0');
-  const h1 = parseFloat(pair.priceChange?.h1 || '0');
-  const h6 = parseFloat(pair.priceChange?.h6 || '0');
-  const liq = parseFloat(pair.liquidity?.usd || '0');
-  const mcap = parseFloat(pair.fdv || pair.marketCap || '0');
-  const volH24 = parseFloat(pair.volume?.h24 || '0');
-  const volH1 = parseFloat(pair.volume?.h1 || '0');
-  // Graduated token: retraced from ATH, now recovering with real volume
-  const retraced = h24 <= -30;
-  const recovering = h1 >= 5 || h6 >= 10;
-  const hasRealLiquidity = liq >= 10000;
-  const inMcapRange = mcap >= 3000 && mcap <= 28000;
-  const volumeReturning = volH24 > 0 && volH1 > 0 && (volH1 / volH24) > 0.25;
-  return retraced && recovering && hasRealLiquidity && inMcapRange && volumeReturning;
-}
-
-function isEarlyMomentumCandidate(pair: any): boolean {
-  const mcap = parseFloat(pair.fdv || pair.marketCap || '0');
-  const liq = parseFloat(pair.liquidity?.usd || '0');
-  const volH24 = parseFloat(pair.volume?.h24 || '0');
-  const volH1 = parseFloat(pair.volume?.h1 || '0');
-  const volM5 = parseFloat(pair.volume?.m5 || '0');
-  // Ultra low cap with sudden volume spike — catching the very bottom before it moves
-  const isLowCap = mcap >= 1000 && mcap <= 8000;
-  const hasMinLiquidity = liq >= 3000;
-  // 5-minute volume should be significant relative to hourly — sudden spike
-  const hasMomentum = volM5 > 0 && volH1 > 0 && (volM5 / (volH1 / 12)) > 3;
-  // Also check: h1 just started going positive
-  const h1 = parseFloat(pair.priceChange?.h1 || '0');
-  const justStartedMoving = h1 >= 2 && h1 <= 40; // started but not already pumped
-  return isLowCap && hasMinLiquidity && hasMomentum && justStartedMoving;
+  const volH6 = parseFloat(pair.volume?.h6 || '0');
+  const dumpedHard = h24 <= -40;
+  const recoveringH1 = h1 >= 5;
+  const recoveringH6 = h6 >= 10;
+  const volumeReturning = volH6 > 0 && volH24 > 0 && (volH6 / volH24) > 0.3;
+  return dumpedHard && (recoveringH1 || recoveringH6) && volumeReturning;
 }
 
 function startPumpPortalStream() {
@@ -331,8 +203,7 @@ function startPumpPortalStream() {
         wssPumpTokensQueue.push({
           tokenAddress: token.mint,
           source: 'pumpfun-new',
-          cachedMcap: token.usdMarketCap || token.vSolInBondingCurve || 0,
-          cachedLiquidity: token.vSolInBondingCurve ? token.vSolInBondingCurve * 0.3 : 0,
+          cachedMcap: token.vSolInBondingCurve || 30000,
           cachedName: token.symbol,
           createdAt: Date.now()
         });
@@ -344,23 +215,6 @@ function startPumpPortalStream() {
     setTimeout(startPumpPortalStream, 5000);
   });
   ws.on('error', (err: any) => console.error("⚠️ WSS Error:", err.message));
-}
-
-// ── Fetch real pump.fun data for WSS tokens before scoring ──
-async function fetchPumpFunTokenData(address: string): Promise<{ mcap: number; liquidity: number; price: number } | null> {
-  try {
-    const res = await axios.get(`https://frontend-api.pump.fun/coins/${address}`, {
-      timeout: 4000,
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36' }
-    });
-    const mcap = parseFloat(res.data?.usd_market_cap || '0');
-    const price = parseFloat(res.data?.price || '0');
-    // pump.fun bonding curve liquidity approximation
-    const virtualSolReserves = parseFloat(res.data?.virtual_sol_reserves || '0');
-    const liquidity = virtualSolReserves > 0 ? virtualSolReserves * 0.3 : mcap * 0.15;
-    if (mcap > 0) return { mcap, liquidity, price };
-  } catch {}
-  return null;
 }
 
 async function getLivePrice(address: string): Promise<{ price: number; mcap: number }> {
@@ -379,6 +233,7 @@ async function getLivePrice(address: string): Promise<{ price: number; mcap: num
       }
     }
   } catch {}
+
   try {
     const pumpRes = await axios.get(`https://frontend-api.pump.fun/coins/${address}`, {
       timeout: 4000,
@@ -388,6 +243,7 @@ async function getLivePrice(address: string): Promise<{ price: number; mcap: num
     const mcap = parseFloat(pumpRes.data?.usd_market_cap || '0');
     if (price > 0) return { price, mcap };
   } catch {}
+
   try {
     const dexRes = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${address}`, { timeout: 5000 });
     const pair = dexRes.data?.pairs?.[0];
@@ -395,6 +251,7 @@ async function getLivePrice(address: string): Promise<{ price: number; mcap: num
     const mcap = parseFloat(pair?.fdv || pair?.marketCap || '0');
     if (price > 0) return { price, mcap };
   } catch {}
+
   return { price: 0, mcap: 0 };
 }
 
@@ -423,7 +280,6 @@ async function monitorPositions() {
           updated.peakMcap = currentMcap;
           updated.peakTime = now;
           console.log(`📈 New peak ${rec.ticker}: $${currentPrice.toFixed(8)} (+${(((currentPrice - rec.alertPrice) / rec.alertPrice) * 100).toFixed(1)}%)`);
-          await updateTradePeak(address, currentPrice, currentMcap);
         }
         alertHistory.set(address, updated);
       }
@@ -436,51 +292,83 @@ async function monitorPositions() {
         const pnlPct = ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
         const holdingMins = Math.floor((now - pos.entryTime) / 60000);
 
-        // ── LEVEL 1: Token hits +70% — sell everything immediately ──
-        if (pnlPct >= 70 && updated.remainingPct > 0) {
-          const pnlSol = (pos.sizeSol * pnlPct) / 100;
-          const msg = [
-            `🎯 *TAKE PROFIT — +70% TARGET HIT*`, ``,
-            `*Token:* $${escapeText(pos.ticker)}`,
-            `*Address:* \`${address}\``, ``,
-            `*Entry Price:* $${pos.entryPrice.toFixed(8)}`,
-            `*Exit Price:* $${currentPrice.toFixed(8)}`,
-            `*PnL:* 🟢 +${pnlPct.toFixed(2)}%`,
-            `*PnL in SOL:* +${pnlSol.toFixed(4)} SOL`,
-            `*Size:* ${pos.sizeSol} SOL`,
-            `*Held:* ${holdingMins} minutes`, ``,
-            `✅ Full position closed at +70% target`,
-          ].join('\n');
-          await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
-          await closeTrade(address, currentPrice, 'TP_70PCT', pos.sizeSol);
-          openPositions.delete(address);
-          console.log(`✅ Position closed at +70%: ${pos.ticker}`);
-          return;
-        }
-
-        // ── LEVEL 2: Token hits +30% — tighten stop loss to -15% below entry ──
-        if (pnlPct >= 30 && updated.stopLossLevel === 'initial') {
-          updated.stopLossLevel = 'level2';
-          updated.stopLossPct = -15;
-          console.log(`🔒 ${pos.ticker} stop loss tightened to -15% below entry (profit: +${pnlPct.toFixed(1)}%)`);
+        // ── DYNAMIC TRAILING STOP LOSS ──
+        // Level 1: profit hits +15% → move stop loss to -10% below entry
+        if (pnlPct >= 15 && updated.stopLossLevel === 'initial') {
+          updated.stopLossLevel = 'breakeven';
+          updated.stopLossPct = -10;
+          console.log(`🔒 ${pos.ticker} stop loss moved to -10% below entry (profit: +${pnlPct.toFixed(1)}%)`);
           await bot.telegram.sendMessage(CHAT_ID,
-            `🔒 *STOP LOSS TIGHTENED*\n\n*Token:* $${escapeText(pos.ticker)}\n*Profit hit:* +${pnlPct.toFixed(1)}%\n*Stop loss moved to:* \\-15% below entry\n*Reduces loss if it retraces*`,
+            `🔒 *STOP LOSS UPGRADED*\n\n*Token:* $${escapeText(pos.ticker)}\n*Profit hit:* +${pnlPct.toFixed(1)}%\n*Stop loss moved to:* -10% below entry\n*Protected from:* full loss`,
             { parse_mode: 'Markdown' }
           );
         }
 
-        // ── STOP LOSS CHECK ──
+        // Level 2: profit hits +60% → move stop loss to +2% above entry (locks in profit)
+        if (pnlPct >= 60 && updated.stopLossLevel === 'breakeven') {
+          updated.stopLossLevel = 'trailing';
+          updated.stopLossPct = 2;
+          console.log(`🔐 ${pos.ticker} stop loss locked to +2% above entry (profit: +${pnlPct.toFixed(1)}%)`);
+          await bot.telegram.sendMessage(CHAT_ID,
+            `🔐 *STOP LOSS LOCKED IN PROFIT*\n\n*Token:* $${escapeText(pos.ticker)}\n*Profit hit:* +${pnlPct.toFixed(1)}%\n*Stop loss moved to:* +2% above entry\n*This trade cannot lose now*`,
+            { parse_mode: 'Markdown' }
+          );
+        }
+
+        // ── STAGED TAKE PROFIT ──
+        // 60% at +100%, 15% at +250%, 15% at +500%, 10% at +900%
+        let tpMsg = '';
+        let soldPct = 0;
+
+        if (pnlPct >= 100 && updated.remainingPct > 40) {
+          soldPct = 60;
+          updated.remainingPct = 40;
+          tpMsg = `🎯 *TAKE PROFIT 1 — +100%*\n• Sold: 60% of position\n• Remaining: 40%\n• Next TP: +250%`;
+        } else if (pnlPct >= 250 && updated.remainingPct > 25) {
+          soldPct = 15;
+          updated.remainingPct = 25;
+          tpMsg = `🎯 *TAKE PROFIT 2 — +250%*\n• Sold: 15% of position\n• Remaining: 25%\n• Next TP: +500%`;
+        } else if (pnlPct >= 500 && updated.remainingPct > 10) {
+          soldPct = 15;
+          updated.remainingPct = 10;
+          tpMsg = `🎯 *TAKE PROFIT 3 — +500%*\n• Sold: 15% of position\n• Remaining: 10%\n• Next TP: +900%`;
+        } else if (pnlPct >= 900 && updated.remainingPct > 0) {
+          soldPct = 10;
+          updated.remainingPct = 0;
+          tpMsg = `🎯 *TAKE PROFIT 4 — +900%*\n• Sold: final 10% of position\n• Position fully closed`;
+        }
+
+        if (tpMsg) {
+          const pnlSol = (pos.sizeSol * (soldPct / 100) * pnlPct) / 100;
+          const fullMsg = [
+            tpMsg, ``,
+            `*Token:* $${escapeText(pos.ticker)}`,
+            `*Entry:* $${pos.entryPrice.toFixed(8)}`,
+            `*Current:* $${currentPrice.toFixed(8)}`,
+            `*PnL:* 🟢 +${pnlPct.toFixed(2)}%`,
+            `*Profit taken:* +${pnlSol.toFixed(4)} SOL`,
+          ].join('\n');
+          await bot.telegram.sendMessage(CHAT_ID, fullMsg, { parse_mode: 'Markdown' });
+
+          // If fully exited
+          if (updated.remainingPct === 0) {
+            openPositions.delete(address);
+            console.log(`✅ Position fully closed: ${pos.ticker} at +${pnlPct.toFixed(1)}%`);
+            openPositions.set(address, updated);
+            return;
+          }
+        }
+
+        // ── STOP LOSS CHECK — uses dynamic level ──
         const stopLossPrice = pos.entryPrice * (1 + updated.stopLossPct / 100);
         const stopLossHit = currentPrice <= stopLossPrice;
 
         if (stopLossHit && updated.remainingPct > 0) {
-          const pnlSol = (pos.sizeSol * pnlPct) / 100;
+          const pnlSol = (pos.sizeSol * (updated.remainingPct / 100) * pnlPct) / 100;
           const stopLabel =
-            updated.stopLossLevel === 'level2'
-              ? '🔒 TIGHTENED STOP — -15% Below Entry'
-              : '🛑 STOP LOSS — -20% Hit';
-          const exitType =
-            updated.stopLossLevel === 'level2' ? 'TIGHTENED_STOP' : 'STOP_LOSS';
+            updated.stopLossLevel === 'trailing' ? '🔐 TRAILING STOP — +2% Above Entry' :
+            updated.stopLossLevel === 'breakeven' ? '🔒 DYNAMIC STOP — -10% Below Entry' :
+            '🛑 STOP LOSS — -20% Hit';
 
           const msg = [
             `💰 *POSITION CLOSED*`, ``,
@@ -495,7 +383,6 @@ async function monitorPositions() {
             stopLabel,
           ].join('\n');
           await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
-          await closeTrade(address, currentPrice, exitType, pos.sizeSol);
           openPositions.delete(address);
           console.log(`✅ Closed via stop loss: ${pos.ticker} ${pnlPct.toFixed(1)}%`);
           return;
@@ -512,217 +399,121 @@ async function monitorPositions() {
 }
 
 async function scan() {
-  console.log("🔍 Scanning 7 sources: pump.fun WSS + DEX new + Reversals + Post-Bond + Early Momentum + PumpSwap + Profiles...");
+  console.log("🔍 Scanning pump.fun + PumpSwap + Early Detection + Reversals...");
   try {
 
-    // ── All 7 sources fetched in parallel for speed ──
-    const [
-      profilesResult,
-      pumpSwapResult,
-      newDexResult,
-      reversalResult,
-      postBondResult,
-      earlyMomentumResult
-    ] = await Promise.allSettled([
-      // 1. Profiles
-      axios.get('https://api.dexscreener.com/token-profiles/latest/v1', { timeout: 10000 }),
-      // 2. PumpSwap
-      axios.get('https://api.dexscreener.com/latest/dex/pairs/solana/pumpfun', { timeout: 10000 }),
-      // 3. New DEX pairs
-      axios.get('https://api.dexscreener.com/latest/dex/search?q=pump.fun&chainIds=solana', { timeout: 10000 }),
-      // 4. Reversals — pump.fun tokens that dumped hard and are recovering
-      axios.get('https://api.dexscreener.com/latest/dex/search?q=pump&chainIds=solana&sort=h1Change&order=desc', { timeout: 10000 }),
-      // 5. Post-bond — Raydium pairs recovering after bonding curve graduation retrace
-      axios.get('https://api.dexscreener.com/latest/dex/pairs/solana/raydium', { timeout: 10000 }),
-      // 6. Early momentum — ultra low cap with sudden volume spike
-      axios.get('https://api.dexscreener.com/latest/dex/search?q=pump.fun&chainIds=solana&sort=volume&order=desc', { timeout: 10000 }),
-    ]);
+    const profilesRes = await axios.get('https://api.dexscreener.com/token-profiles/latest/v1', { timeout: 10000 });
+    const profiles = profilesRes.data || [];
+    const pumpProfiles = profiles
+      .filter((p: any) => typeof p.tokenAddress === 'string' && p.tokenAddress.endsWith('pump'))
+      .map((p: any) => ({ tokenAddress: p.tokenAddress, source: 'profiles' }));
 
-    // ── Process profiles ──
-    const pumpProfiles: any[] = [];
-    if (profilesResult.status === 'fulfilled') {
-      const profiles = profilesResult.value.data || [];
-      profiles
-        .filter((p: any) => typeof p.tokenAddress === 'string' && p.tokenAddress.endsWith('pump'))
-        .forEach((p: any) => pumpProfiles.push({ tokenAddress: p.tokenAddress, source: 'profiles' }));
-    }
-    console.log(`Profiles: ${pumpProfiles.length}`);
-
-    // ── Process PumpSwap ──
-    const pumpSwapProfiles: any[] = [];
-    if (pumpSwapResult.status === 'fulfilled') {
-      (pumpSwapResult.value.data?.pairs || [])
+    let pumpSwapProfiles: any[] = [];
+    try {
+      const pumpSwapRes = await axios.get('https://api.dexscreener.com/latest/dex/pairs/solana/pumpfun', { timeout: 10000 });
+      pumpSwapProfiles = (pumpSwapRes.data?.pairs || [])
         .filter((p: any) => p.baseToken?.address && p.chainId === 'solana')
-        .forEach((p: any) => pumpSwapProfiles.push({ tokenAddress: p.baseToken.address, source: 'pumpswap', cachedPair: p }));
-    }
-    console.log(`PumpSwap: ${pumpSwapProfiles.length} pairs`);
+        .map((p: any) => ({ tokenAddress: p.baseToken.address, source: 'pumpswap', cachedPair: p }));
+      console.log(`PumpSwap: ${pumpSwapProfiles.length} pairs`);
+    } catch (psErr: any) { console.log(`⚠️ PumpSwap failed: ${psErr.message}`); }
 
-    // ── Process WSS new tokens ──
-    const newPumpTokens = [...wssPumpTokensQueue];
-    wssPumpTokensQueue.length = 0;
-    console.log(`Pump.fun new (via WSS): ${newPumpTokens.length} tokens`);
+    let newPumpTokens: any[] = [];
+    try {
+      newPumpTokens = [...wssPumpTokensQueue];
+      wssPumpTokensQueue.length = 0;
+      console.log(`Pump.fun new (via WSS): ${newPumpTokens.length} tokens`);
+    } catch (nErr: any) { console.log(`⚠️ WSS queue error: ${nErr.message}`); }
 
-    // ── Process new DEX pairs ──
-    const newDexPairs: any[] = [];
-    if (newDexResult.status === 'fulfilled') {
-      (newDexResult.value.data?.pairs || [])
+    let newDexPairs: any[] = [];
+    try {
+      const newPairsRes = await axios.get('https://api.dexscreener.com/latest/dex/search?q=pump.fun&chainIds=solana', { timeout: 10000 });
+      newDexPairs = (newPairsRes.data?.pairs || [])
         .filter((p: any) =>
           p.baseToken?.address?.endsWith('pump') &&
           p.chainId === 'solana' &&
           p.pairCreatedAt && (Date.now() - p.pairCreatedAt) < 2 * 60 * 60 * 1000
         )
-        .forEach((p: any) => newDexPairs.push({ tokenAddress: p.baseToken.address, source: 'dex-new', cachedPair: p }));
-    }
-    console.log(`New DEX pairs: ${newDexPairs.length}`);
+        .map((p: any) => ({ tokenAddress: p.baseToken.address, source: 'dex-new', cachedPair: p }));
+      console.log(`New DEX pairs: ${newDexPairs.length}`);
+    } catch (dErr: any) { console.log(`⚠️ New DEX pairs failed: ${dErr.message}`); }
 
-    // ── Process reversals ──
-    const reversalTokens: any[] = [];
-    if (reversalResult.status === 'fulfilled') {
-      (reversalResult.value.data?.pairs || [])
+    let reversalTokens: any[] = [];
+    try {
+      const reversalRes = await axios.get('https://api.dexscreener.com/latest/dex/search?q=solana&chainIds=solana', { timeout: 10000 });
+      reversalTokens = (reversalRes.data?.pairs || [])
         .filter((p: any) =>
           p.baseToken?.address?.endsWith('pump') &&
           p.chainId === 'solana' &&
           isReversalCandidate(p) &&
           parseFloat(p.fdv || p.marketCap || '0') >= 1000 &&
-          parseFloat(p.fdv || p.marketCap || '0') <= 28000
+          parseFloat(p.fdv || p.marketCap || '0') <= 40000
         )
-        .forEach((p: any) => reversalTokens.push({ tokenAddress: p.baseToken.address, source: 'reversal', cachedPair: p }));
-    }
-    console.log(`Reversals: ${reversalTokens.length}`);
+        .map((p: any) => ({ tokenAddress: p.baseToken.address, source: 'reversal', cachedPair: p }));
+      console.log(`Reversals: ${reversalTokens.length}`);
+    } catch (rErr: any) { console.log(`⚠️ Reversal scan failed: ${rErr.message}`); }
 
-    // ── Process post-bond (Raydium graduated tokens retracing and recovering) ──
-    const postBondTokens: any[] = [];
-    if (postBondResult.status === 'fulfilled') {
-      (postBondResult.value.data?.pairs || [])
-        .filter((p: any) =>
-          p.chainId === 'solana' &&
-          isPostBondCandidate(p)
-        )
-        .forEach((p: any) => postBondTokens.push({ tokenAddress: p.baseToken.address, source: 'post-bond', cachedPair: p }));
-    }
-    console.log(`Post-bond: ${postBondTokens.length}`);
-
-    // ── Process early momentum ──
-    const earlyMomentumTokens: any[] = [];
-    if (earlyMomentumResult.status === 'fulfilled') {
-      (earlyMomentumResult.value.data?.pairs || [])
-        .filter((p: any) =>
-          p.baseToken?.address?.endsWith('pump') &&
-          p.chainId === 'solana' &&
-          isEarlyMomentumCandidate(p)
-        )
-        .forEach((p: any) => earlyMomentumTokens.push({ tokenAddress: p.baseToken.address, source: 'early-momentum', cachedPair: p }));
-    }
-    console.log(`Early momentum: ${earlyMomentumTokens.length}`);
-
-    // ── Priority ordering: lowest cap highest potential first ──
+    // ── FIX 2: Prioritize WSS new tokens first before slicing to 40 ──
     const prioritized = [
-      ...earlyMomentumTokens,  // 1. Ultra low cap volume spike — best bottom catchers
-      ...newPumpTokens,         // 2. Fresh WSS launches
-      ...newDexPairs,           // 3. New DEX pairs
-      ...reversalTokens,        // 4. Dump and recover
-      ...postBondTokens,        // 5. Post-graduation retrace recovery
-      ...pumpSwapProfiles,      // 6. PumpSwap
-      ...pumpProfiles           // 7. Trending profiles
+      ...newPumpTokens,
+      ...newDexPairs,
+      ...reversalTokens,
+      ...pumpSwapProfiles,
+      ...pumpProfiles
     ].filter((p, i, arr) => arr.findIndex(x => x.tokenAddress === p.tokenAddress) === i);
 
-    console.log(`Total candidates: ${prioritized.length} across 7 sources`);
+    console.log(`Total candidates: ${prioritized.length} across 5 sources`);
 
-    for (const p of prioritized.slice(0, 60)) {
+    for (const p of prioritized.slice(0, 40)) {
       try {
-        await new Promise(resolve => setTimeout(resolve, 500));
-        if (hasSeenToken(p.tokenAddress)) continue;
+        await new Promise(resolve => setTimeout(resolve, 800));
+        if (seenTokens.has(p.tokenAddress)) continue;
 
         let pair = p.cachedPair || null;
-
-        // ── For WSS new tokens: fetch real pump.fun data first ──
-        const isNew = p.source === 'pumpfun-new' || p.source === 'dex-new';
-        const isReversal = p.source === 'reversal';
-        const isPostBond = p.source === 'post-bond';
-        const isEarlyMomentum = p.source === 'early-momentum';
-
-        let mcap = 0;
-        let liquidity = 0;
-        let currentPrice = 0;
-
-        if (p.source === 'pumpfun-new') {
-          // ── Fetch real data from pump.fun API for WSS tokens ──
-          const pumpData = await fetchPumpFunTokenData(p.tokenAddress);
-          if (!pumpData || pumpData.mcap <= 0) {
-            // Fall back to DexScreener if pump.fun API fails
-            try {
-              const { data } = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${p.tokenAddress}`, { timeout: 8000 });
-              pair = data?.pairs?.[0];
-            } catch {
-              markTokenSeen(p.tokenAddress);
-              continue;
-            }
-          } else {
-            mcap = pumpData.mcap;
-            liquidity = pumpData.liquidity;
-            currentPrice = pumpData.price;
-          }
-        }
-
-        if (!pair && mcap === 0) {
+        if (!pair) {
           try {
             const { data } = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${p.tokenAddress}`, { timeout: 8000 });
             pair = data?.pairs?.[0];
           } catch {
-            markTokenSeen(p.tokenAddress);
+            seenTokens.add(p.tokenAddress);
             continue;
           }
         }
 
-        // ── Extract data from pair if we have it ──
-        if (pair) {
-          mcap = parseFloat(pair.fdv || pair.marketCap || '0');
-          const rawLiquidity = parseFloat(pair.liquidity?.usd || '0');
-          currentPrice = parseFloat(pair.priceUsd || '0');
-
-          // ── Real liquidity required for non-new tokens — NO estimation ──
-          if (isNew) {
-            liquidity = rawLiquidity > 0 ? rawLiquidity : (mcap * 0.15);
-          } else {
-            // For established tokens, require real liquidity data
-            if (rawLiquidity === 0) {
-              console.log(`⏭ ${pair.baseToken?.symbol || p.tokenAddress}: No real liquidity data, skipping`);
-              continue; // soft skip — don't mark seen
-            }
-            liquidity = rawLiquidity;
-          }
-        }
-
+        let mcap = pair ? parseFloat(pair.fdv || pair.marketCap || '0') : (p.cachedMcap || 0);
+        let liquidity = pair ? parseFloat(pair.liquidity?.usd || '0') : 0;
         const ticker = pair?.baseToken?.symbol || p.cachedName || 'UNKNOWN';
         const address = pair?.baseToken?.address || p.tokenAddress;
         const creatorAddress = pair?.info?.deployer || undefined;
+        const currentPrice = parseFloat(pair?.priceUsd || '0');
 
-        if (!mcap) { markTokenSeen(p.tokenAddress); continue; }
+        if (!liquidity && mcap > 0) liquidity = mcap * 0.15;
+        if (!mcap) { seenTokens.add(p.tokenAddress); continue; }
 
-        // ── mcap ceiling: $28k for all sources ──
-        const mcapMin = 1000;
-        const mcapMax = 28000;
+        const isNew = p.source === 'pumpfun-new' || p.source === 'dex-new';
+        const isReversal = p.source === 'reversal';
+        const mcapMin = isNew ? 500 : 1000;
 
-        if (mcap < mcapMin || mcap > mcapMax) continue; // soft skip
+        // ── FIX 1: Soft skips do NOT add to seenTokens — token stays eligible for re-scan ──
+        if (mcap < mcapMin || mcap > 40000) continue;
 
-        // ── Time-alive filter — skip tokens under 7 minutes old (non-WSS only) ──
+        // ── Number 4: Time-alive filter — skip tokens under 7 minutes old (non-WSS only) ──
         if (!isNew && pair?.pairCreatedAt) {
           const ageMinutes = (Date.now() - pair.pairCreatedAt) / 60000;
           if (ageMinutes < 7) {
             console.log(`⏭ ${ticker} too young: ${ageMinutes.toFixed(1)} mins old, skipping`);
-            continue; // soft skip
+            // ── FIX 1: Soft skip — do NOT add to seenTokens ──
+            continue;
           }
         }
 
         const rugProb = computeRugProbability(mcap, liquidity);
         const alphaScore = computeAlphaScore(mcap, liquidity, rugProb);
-
-        // ── Score minimums by source ──
         const scoreMin = isNew ? 70 : 75;
 
-        console.log(`[${p.source}] ${ticker}: MCAP $${mcap.toFixed(0)} | Liq $${liquidity.toFixed(0)} | Score ${alphaScore}/100`);
+        console.log(`[${p.source}] ${ticker}: MCAP $${mcap} | Liq $${liquidity} | Score ${alphaScore}/100`);
 
-        if (alphaScore < scoreMin) continue; // soft skip
+        // ── FIX 1: Low score is a soft skip — do NOT add to seenTokens ──
+        if (alphaScore < scoreMin) continue;
 
         const signal: TokenSignal = {
           tokenAddress: address, ticker, alphaScore,
@@ -730,13 +521,14 @@ async function scan() {
         };
 
         const [pattern, risk] = await Promise.all([
-          intelligence.analyzePattern(signal, creatorAddress, isNew, isPostBond),
+          // ── FIX 3: Pass isNew to analyzePattern so new tokens skip LOW_BUYER_VELOCITY gate ──
+          intelligence.analyzePattern(signal, creatorAddress, isNew),
           riskEngine.validateExecutionRisk(signal),
         ]);
 
         if (!pattern.passedPatterns) {
           console.log(`⏭ ${ticker} failed: ${pattern.reason}`);
-          markTokenSeen(p.tokenAddress);
+          seenTokens.add(p.tokenAddress);
           continue;
         }
 
@@ -749,27 +541,8 @@ async function scan() {
 
         if (risk.allow) {
           try {
-            let tx;
-            // ── Post-bond tokens on Raydium use Jupiter ──
-            // ── Pre-graduation pump.fun tokens use direct bonding curve ──
-            if (isPostBond) {
-              tx = await executor.buildJupiterSwapTransaction(address, risk.sizeSol, 'BUY');
-              tx.sign([executor.getWalletKeypair()]);
-              console.log(`🌊 Using Jupiter for post-bond token: ${ticker}`);
-            } else if (address.endsWith('pump')) {
-              try {
-                tx = await executor.buildPumpFunSwapTransaction(address, risk.sizeSol, 'BUY');
-                console.log(`⚡ Using direct pump.fun bonding curve for ${ticker}`);
-              } catch (pumpErr: any) {
-                console.log(`⚠️ Pump.fun direct failed (${pumpErr.message}), falling back to Jupiter`);
-                tx = await executor.buildJupiterSwapTransaction(address, risk.sizeSol, 'BUY');
-                tx.sign([executor.getWalletKeypair()]);
-              }
-            } else {
-              tx = await executor.buildJupiterSwapTransaction(address, risk.sizeSol, 'BUY');
-              tx.sign([executor.getWalletKeypair()]);
-            }
-
+            const tx = await executor.buildJupiterSwapTransaction(address, risk.sizeSol, 'BUY');
+            tx.sign([executor.getWalletKeypair()]);
             const result = await executor.dispatchMevProtectedBundle(tx);
             if (result.success) {
               const txLink = result.bundleId ? ` — [Solscan](https://solscan.io/tx/${result.bundleId})` : '';
@@ -783,6 +556,7 @@ async function scan() {
                   peakPrice: executedPrice,
                   sizeSol: executedSizeSol,
                   entryTime: Date.now(),
+                  // ── Start with initial stop loss at -30% ──
                   stopLossLevel: 'initial',
                   stopLossPct: -20,
                   remainingPct: 100,
@@ -803,6 +577,7 @@ async function scan() {
           executionState = `❌ Auto\\-Buy Blocked: ${escapeText(risk.reason || '')}`;
         }
 
+        // ✅ Only set alert record if NOT already tracked — preserve original alertTime
         if (!alertHistory.has(address)) {
           alertHistory.set(address, {
             ticker, address,
@@ -817,44 +592,20 @@ async function scan() {
             lastUpdated: Date.now()
           });
           await saveHistory();
-
-          const tradeStatus = executedPrice > 0 ? 'OPEN' : 'ALERTED';
-          await logTradeAlert({
-            address, ticker, source: p.source,
-            alertPrice: currentPrice, alertMcap: mcap,
-            entryPrice: executedPrice, entrySizeSol: executedSizeSol,
-            alphaScore, rugProbability: rugProb,
-            uniqueBuyers: pattern.uniqueBuyers,
-            buyerVelocity: pattern.buyerVelocity,
-            topHolderPct: pattern.topHolderConcentration,
-            isBundledLaunch: pattern.isBundledLaunch,
-            washTrading: pattern.washTradingDetected,
-            smartMoney: pattern.smartCohortPresence,
-            status: tradeStatus,
-          });
         }
 
         const walletShort = `${executor.getWalletPublicKey().slice(0, 8)}...${executor.getWalletPublicKey().slice(-4)}`;
         const sourceLabel: Record<string, string> = {
-          'pumpfun-new':    '🆕 Pump\\.fun \\(Just Launched\\)',
-          'dex-new':        '⚡ New DEX Pair',
-          'pumpswap':       '🔄 PumpSwap',
-          'profiles':       '📈 Trending',
-          'reversal':       '🔄 Reversal \\(Dump & Recover\\)',
-          'post-bond':      '🎓 Post\\-Bond \\(Graduated & Retraced\\)',
-          'early-momentum': '🚀 Early Momentum \\(Volume Spike\\)',
+          'pumpfun-new': '🆕 Pump\\.fun \\(Just Launched\\)',
+          'dex-new': '⚡ New DEX Pair',
+          'pumpswap': '🔄 PumpSwap',
+          'profiles': '📈 Trending',
+          'reversal': '🔄 Reversal \\(Retraced & Building\\)'
         };
 
-        const extraLine: string[] = [];
-        if (isReversal) {
-          extraLine.push(``, `📉 *Reversal Signal:* 24h: ${h24.toFixed(1)}% | 1h: +${h1.toFixed(1)}% recovering`);
-        }
-        if (isPostBond) {
-          extraLine.push(``, `🎓 *Post\\-Bond:* Graduated, retraced, recovering | 1h: +${h1.toFixed(1)}%`);
-        }
-        if (isEarlyMomentum) {
-          extraLine.push(``, `🚀 *Early Momentum:* Volume spike detected at low cap`);
-        }
+        const reversalLine = isReversal
+          ? [``, `📉 *Reversal Signal:* 24h: ${h24.toFixed(1)}% | 1h: +${h1.toFixed(1)}% recovering`]
+          : [];
 
         const msg = [
           `🚨🚨 *AUTONOMOUS AI DEGEN CALL* 🚨🚨`, ``,
@@ -863,7 +614,7 @@ async function scan() {
           `*Market Cap:* 💰 $${mcap.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
           `*Liquidity:* $${liquidity.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
           `*Source:* ${sourceLabel[p.source] || '📈 Trending'}`,
-          ...extraLine, ``,
+          ...reversalLine, ``,
           `🤖 *Execution State:*`,
           executionState, ``,
           `👾 *Deployer Metrics:*`,
@@ -886,7 +637,8 @@ async function scan() {
         await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
         console.log(`✅ Alert sent: ${ticker} — Score: ${alphaScore}/100 — Source: ${p.source}`);
 
-        markTokenSeen(p.tokenAddress);
+        seenTokens.add(p.tokenAddress);
+        if (seenTokens.size > 500) seenTokens.clear();
 
       } catch (innerErr: any) {
         console.log(`❌ Error on token: ${innerErr.message}`);
@@ -900,6 +652,8 @@ async function scan() {
 // ✅ Initialize DB schema + load history before launching
 async function init() {
   await initDatabaseSchema();
+
+  // ✅ Create alert_history table if not exists
   try {
     await db.query(`
       CREATE TABLE IF NOT EXISTS alert_history (
@@ -920,6 +674,7 @@ async function init() {
   } catch (e: any) {
     console.log(`⚠️ alert_history table setup failed: ${e.message}`);
   }
+
   await loadHistory();
 }
 
@@ -938,12 +693,13 @@ bot.launch({
       console.log('🏓 Self-ping sent — bot is alive');
     } catch {}
   }, 5 * 60 * 1000);
+
 }).catch((err) => {
   console.error("Fatal Launch Error:", err);
   process.exit(1);
 });
 
-bot.command('test', (ctx) => ctx.reply('✅ Bot online. Scanning 7 sources: pump.fun WSS + DEX new + Reversals + Post-Bond + Early Momentum + PumpSwap + Profiles.'));
+bot.command('test', (ctx) => ctx.reply('✅ Bot online. Scanning pump.fun (via WSS) + PumpSwap + Early Detection + Reversals.'));
 
 bot.command('positions', async (ctx) => {
   if (openPositions.size === 0) return ctx.reply('📭 No open positions.');
@@ -960,11 +716,14 @@ bot.command('positions', async (ctx) => {
   ctx.reply(lines.join('\n'), { parse_mode: 'Markdown' });
 });
 
+// ── Helper: build collective PnL token list for a period ──
 function getPeriodDateString(period: string): string {
   const today = new Date();
   const formatDate = (d: Date) => d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
   const todayStr = formatDate(today);
+
   let dateString = '';
+
   if (period === 'daily') {
     dateString = todayStr;
   } else if (period === 'weekly') {
@@ -976,6 +735,7 @@ function getPeriodDateString(period: string): string {
   } else if (period === 'lifetime') {
     let firstDate = new Date();
     if (alertHistory.size > 0) {
+      // Memory-safe loop to find the oldest alert date without exceeding the call stack
       let earliest = Date.now();
       for (const r of alertHistory.values()) {
         if (r.alertTime < earliest) earliest = r.alertTime;
@@ -984,24 +744,20 @@ function getPeriodDateString(period: string): string {
     }
     dateString = `${formatDate(firstDate)} - ${todayStr}`;
   }
+  
+  // Safely escape the generated string (specifically hyphens) for Telegram Markdown
   return escapeText(dateString);
 }
 
 async function buildPeriodPnlMessage(period: string): Promise<{ text: string; buttons: any[] }> {
   const now = Date.now();
-  let cutoff: number;
-  if (period === 'daily') {
-    const todayUTC = new Date();
-    todayUTC.setUTCHours(0, 0, 0, 0);
-    cutoff = todayUTC.getTime();
-  } else if (period === 'weekly') {
-    cutoff = now - 7 * 24 * 60 * 60 * 1000;
-  } else if (period === 'monthly') {
-    cutoff = now - 30 * 24 * 60 * 60 * 1000;
-  } else {
-    cutoff = 0;
-  }
-
+  const periodMs: Record<string, number> = {
+    daily: 24 * 60 * 60 * 1000,
+    weekly: 7 * 24 * 60 * 60 * 1000,
+    monthly: 30 * 24 * 60 * 60 * 1000,
+    lifetime: Infinity
+  };
+  const cutoff = period === 'lifetime' ? 0 : now - periodMs[period];
   const filtered = Array.from(alertHistory.entries())
     .filter(([, rec]) => rec.alertTime >= cutoff)
     .sort((a, b) => b[1].alertTime - a[1].alertTime)
@@ -1019,31 +775,43 @@ async function buildPeriodPnlMessage(period: string): Promise<{ text: string; bu
     const label = `$${rec.ticker} | Peak: +${pnlPct}%`;
     return [Markup.button.callback(label, `pnl_${address}`)];
   });
+
+  // Add refresh button at the bottom
   buttons.push([Markup.button.callback('🔄 Refresh', `period_${period}`)]);
+
   const dateInterval = getPeriodDateString(period);
+
   return {
     text: `📊 *${periodLabel[period]} Calls \\(${dateInterval}\\) \\(${filtered.length} tokens\\):*`,
     buttons
   };
 }
 
+// ✅ /pnl — period selector first, then token list
 bot.command('pnl', async (ctx) => {
-  if (alertHistory.size === 0) return ctx.reply('📭 No alerts recorded yet.');
-  await ctx.reply('📊 *Select a time period:*', {
-    parse_mode: 'Markdown',
-    ...Markup.inlineKeyboard([
-      [Markup.button.callback('📅 Daily', 'period_daily')],
-      [Markup.button.callback('📆 Weekly', 'period_weekly')],
-      [Markup.button.callback('🗓 Monthly', 'period_monthly')],
-      [Markup.button.callback('🏆 Lifetime', 'period_lifetime')],
-    ])
-  });
+  if (alertHistory.size === 0) {
+    return ctx.reply('📭 No alerts recorded yet.');
+  }
+  await ctx.reply(
+    '📊 *Select a time period:*',
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('📅 Daily', 'period_daily')],
+        [Markup.button.callback('📆 Weekly', 'period_weekly')],
+        [Markup.button.callback('🗓 Monthly', 'period_monthly')],
+        [Markup.button.callback('🏆 Lifetime', 'period_lifetime')],
+      ])
+    }
+  );
 });
 
+// ✅ Period selector handler — also handles Refresh button on collective PnL
 bot.action(/^period_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery("Refreshing...");
   const period = ctx.match[1];
   const { text, buttons } = await buildPeriodPnlMessage(period);
+  // buttons.length === 1 means only the refresh button, no tokens found
   if (buttons.length <= 1) {
     try { await ctx.editMessageText("📭 No alerts found for the selected period."); } catch {}
     return;
@@ -1055,8 +823,10 @@ bot.action(/^period_(.+)$/, async (ctx) => {
 
 bot.command('winrate', async (ctx) => {
   if (alertHistory.size === 0) return ctx.reply('📭 No data to analyze yet.');
+
   let totalCalls = 0, hitsPeak = 0, hitsStopLoss = 0;
   let totalGainPct = 0, totalLossPct = 0;
+
   for (const rec of alertHistory.values()) {
     totalCalls++;
     if (rec.peakPrice > rec.alertPrice) {
@@ -1068,6 +838,7 @@ bot.command('winrate', async (ctx) => {
       totalLossPct += 30;
     }
   }
+
   const neutrals = Math.max(0, totalCalls - hitsPeak - hitsStopLoss);
   const hitRate = ((hitsPeak / totalCalls) * 100).toFixed(1);
   const netPnl = totalGainPct - totalLossPct;
@@ -1075,9 +846,11 @@ bot.command('winrate', async (ctx) => {
   const winRate = totalGainPct + totalLossPct > 0
     ? ((totalGainPct / (totalGainPct + totalLossPct)) * 100).toFixed(1)
     : '0.0';
+
   const netEmoji = netPnl >= 0 ? '🟢' : '🔴';
   const winEmoji = parseFloat(winRate) >= 50 ? '🟢' : '🔴';
   const avgEmoji = parseFloat(avgPerTrade) >= 0 ? '🟢' : '🔴';
+
   const lines = [
     `📊 *Bot Performance Summary*`, ``,
     `• *Total Tokens Called:* ${totalCalls}`,
@@ -1091,12 +864,15 @@ bot.command('winrate', async (ctx) => {
     `🎯 *Avg Per Trade:* ${avgEmoji} ${parseFloat(avgPerTrade) >= 0 ? '+' : ''}${avgPerTrade}%`,
     `📈 *Win Rate:* ${winEmoji} ${winRate}%`,
   ];
+
   await ctx.reply(lines.join('\n'), { parse_mode: 'Markdown' });
 });
 
+// ── Helper: build single token PnL message + buttons ──
 async function buildTokenPnlMessage(address: string): Promise<{ text: string; buttons: any[] } | null> {
   const rec = alertHistory.get(address);
   if (!rec) return null;
+
   const alertDate = new Date(rec.alertTime).toUTCString();
   const peakDate = new Date(rec.peakTime).toUTCString();
   const peakPnlPct = rec.peakPrice > 0 && rec.alertPrice > 0
@@ -1106,6 +882,7 @@ async function buildTokenPnlMessage(address: string): Promise<{ text: string; bu
   const peakMcapGain = rec.alertMcap > 0
     ? ((rec.peakMcap - rec.alertMcap) / rec.alertMcap) * 100 : 0;
   const neverPumped = rec.peakPrice <= rec.alertPrice;
+
   const lines = [
     `📊 *PnL Report: $${escapeText(rec.ticker)}*`, ``,
     `*Address:* \`${address}\``,
@@ -1113,6 +890,7 @@ async function buildTokenPnlMessage(address: string): Promise<{ text: string; bu
     `*MCAP at Alert:* $${rec.alertMcap.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
     `*Price at Alert:* $${rec.alertPrice.toFixed(8)}`, ``,
   ];
+
   if (neverPumped) {
     lines.push(`❌ *Did not pump above alert price*`);
     lines.push(`*Current Price:* $${rec.currentPrice.toFixed(8)}`);
@@ -1129,9 +907,14 @@ async function buildTokenPnlMessage(address: string): Promise<{ text: string; bu
     lines.push(`• Price: $${rec.currentPrice.toFixed(8)}`);
     lines.push(`• PnL vs Alert: ${currentPnlPct >= 0 ? '🟢 +' : '🔴 '}${currentPnlPct.toFixed(2)}%`);
   }
+
   lines.push(``);
   lines.push(`📱 [Monitor Chart Live](https://dexscreener.com/solana/${address})`);
-  const buttons = [[Markup.button.callback('🔄 Refresh', `refresh_pnl_${address}`)]];
+
+  const buttons = [
+    [Markup.button.callback('🔄 Refresh', `refresh_pnl_${address}`)]
+  ];
+
   return { text: lines.join('\n'), buttons };
 }
 
@@ -1140,12 +923,19 @@ bot.action(/^pnl_(.+)$/, async (ctx) => {
   const result = await buildTokenPnlMessage(address);
   if (!result) return ctx.answerCbQuery('Token not found in history.');
   await ctx.answerCbQuery();
-  await ctx.reply(result.text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(result.buttons) });
+
+  await ctx.reply(result.text, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard(result.buttons)
+  });
 });
 
+// ✅ Refresh handler for individual token PnL
 bot.action(/^refresh_pnl_(.+)$/, async (ctx) => {
   const address = ctx.match[1];
   await ctx.answerCbQuery('Refreshing...');
+
+  // Fetch latest price before rebuilding
   try {
     const { price: currentPrice, mcap: currentMcap } = await getLivePrice(address);
     if (currentPrice && alertHistory.has(address)) {
@@ -1160,126 +950,17 @@ bot.action(/^refresh_pnl_(.+)$/, async (ctx) => {
       await saveHistory();
     }
   } catch {}
+
   const result = await buildTokenPnlMessage(address);
   if (!result) return;
-  await ctx.editMessageText(result.text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(result.buttons) });
-});
 
-bot.command('report', async (ctx) => {
-  await ctx.reply('📊 *Select report period:*', {
+  await ctx.editMessageText(result.text, {
     parse_mode: 'Markdown',
-    ...Markup.inlineKeyboard([
-      [Markup.button.callback('📅 Daily', 'report_daily')],
-      [Markup.button.callback('📆 Weekly', 'report_weekly')],
-      [Markup.button.callback('🗓 Monthly', 'report_monthly')],
-      [Markup.button.callback('🏆 Lifetime', 'report_lifetime')],
-    ])
+    ...Markup.inlineKeyboard(result.buttons)
   });
 });
 
-bot.action(/^report_(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery('Generating report...');
-  const period = ctx.match[1];
-  let cutoff: number;
-  const now = Date.now();
-  if (period === 'daily') {
-    const todayUTC = new Date();
-    todayUTC.setUTCHours(0, 0, 0, 0);
-    cutoff = todayUTC.getTime();
-  } else if (period === 'weekly') {
-    cutoff = now - 7 * 24 * 60 * 60 * 1000;
-  } else if (period === 'monthly') {
-    cutoff = now - 30 * 24 * 60 * 60 * 1000;
-  } else {
-    cutoff = 0;
-  }
-  try {
-    const result = await db.query(`
-      SELECT
-        ticker, address, source,
-        to_timestamp(alert_time / 1000) AT TIME ZONE 'UTC' AS alert_time,
-        alert_price, alert_mcap,
-        entry_price, entry_size_sol,
-        peak_price, peak_mcap,
-        to_timestamp(peak_time / 1000) AT TIME ZONE 'UTC' AS peak_time,
-        peak_gain_pct,
-        exit_price,
-        to_timestamp(exit_time / 1000) AT TIME ZONE 'UTC' AS exit_time,
-        exit_type, pnl_pct, pnl_sol, held_minutes,
-        alpha_score, rug_probability,
-        unique_buyers, buyer_velocity, top_holder_pct,
-        is_bundled_launch, wash_trading, smart_money, status
-      FROM trades_log
-      WHERE alert_time >= $1
-      ORDER BY alert_time DESC
-    `, [cutoff]);
-
-    if (result.rows.length === 0) {
-      await ctx.reply('📭 No trades found for this period.');
-      return;
-    }
-
-    const headers = [
-      'Ticker','Address','Source','Alert Time (UTC)','Alert Price','Alert MCAP',
-      'Entry Price','Entry Size (SOL)','Peak Price','Peak MCAP','Peak Time (UTC)',
-      'Peak Gain %','Exit Price','Exit Time (UTC)','Exit Type',
-      'PnL %','PnL SOL','Held (mins)',
-      'Alpha Score','Rug Prob','Unique Buyers','Buyer Velocity','Top Holder %',
-      'Bundled Launch','Wash Trading','Smart Money','Status'
-    ];
-    const csvRows = result.rows.map(r => [
-      r.ticker, r.address, r.source,
-      r.alert_time ? new Date(r.alert_time).toISOString() : '',
-      r.alert_price ?? '', r.alert_mcap ?? '',
-      r.entry_price ?? '', r.entry_size_sol ?? '',
-      r.peak_price ?? '', r.peak_mcap ?? '',
-      r.peak_time ? new Date(r.peak_time).toISOString() : '',
-      r.peak_gain_pct ?? '',
-      r.exit_price ?? '',
-      r.exit_time ? new Date(r.exit_time).toISOString() : '',
-      r.exit_type ?? '', r.pnl_pct ?? '', r.pnl_sol ?? '', r.held_minutes ?? '',
-      r.alpha_score ?? '', r.rug_probability ?? '',
-      r.unique_buyers ?? '', r.buyer_velocity ?? '', r.top_holder_pct ?? '',
-      r.is_bundled_launch, r.wash_trading, r.smart_money, r.status
-    ].map(v => `"${String(v).replace(/"/g, '""')}"`).join(','));
-    const csv = [headers.join(','), ...csvRows].join('\n');
-    const csvBuffer = Buffer.from(csv, 'utf-8');
-
-    const closed = result.rows.filter(r => r.status === 'CLOSED' && r.pnl_pct != null);
-    const wins = closed.filter(r => parseFloat(r.pnl_pct) > 0);
-    const losses = closed.filter(r => parseFloat(r.pnl_pct) <= 0);
-    const totalPnlPct = closed.reduce((s, r) => s + parseFloat(r.pnl_pct || '0'), 0);
-    const totalPnlSol = closed.reduce((s, r) => s + parseFloat(r.pnl_sol || '0'), 0);
-    const winRate = closed.length > 0 ? ((wins.length / closed.length) * 100).toFixed(1) : '0.0';
-    const alertedOnly = result.rows.filter(r => r.status === 'ALERTED').length;
-    const periodLabel: Record<string, string> = {
-      daily: 'Daily', weekly: 'Weekly', monthly: 'Monthly', lifetime: 'Lifetime'
-    };
-    const summary = [
-      `📊 *${periodLabel[period]} Trade Report*`, ``,
-      `• *Total Alerts:* ${result.rows.length}`,
-      `• *Executed Trades:* ${result.rows.length - alertedOnly}`,
-      `• *Alert Only \\(no buy\\):* ${alertedOnly}`,
-      `• *Closed Trades:* ${closed.length}`,
-      `• *Wins:* ${wins.length} | *Losses:* ${losses.length}`,
-      `• *Win Rate:* ${parseFloat(winRate) >= 50 ? '🟢' : '🔴'} ${winRate}%`,
-      `• *Total PnL %:* ${totalPnlPct >= 0 ? '🟢 +' : '🔴 '}${totalPnlPct.toFixed(2)}%`,
-      `• *Total PnL SOL:* ${totalPnlSol >= 0 ? '🟢 +' : '🔴 '}${totalPnlSol.toFixed(4)} SOL`,
-      ``, `📎 Full CSV attached below`,
-    ].join('\n');
-    await ctx.reply(summary, { parse_mode: 'Markdown' });
-
-    const filename = `trades_${period}_${new Date().toISOString().slice(0, 10)}.csv`;
-    await bot.telegram.sendDocument(CHAT_ID, {
-      source: csvBuffer, filename
-    }, { caption: `${periodLabel[period]} trades export — ${result.rows.length} records` });
-
-  } catch (e: any) {
-    console.log(`❌ Report error: ${e.message}`);
-    await ctx.reply('❌ Report generation failed. Check logs.');
-  }
-});
-
+// ✅ Heartbeat — console only, NOT Telegram
 setInterval(() => {
   console.log('⏱️ Heartbeat: Bot is awake and monitoring the market...');
 }, 15 * 60 * 1000);
