@@ -296,10 +296,10 @@ async function monitorPositions() {
         // Level 1: profit hits +15% → move stop loss to -10% below entry
         if (pnlPct >= 15 && updated.stopLossLevel === 'initial') {
           updated.stopLossLevel = 'breakeven';
-          updated.stopLossPct = -10;
-          console.log(`🔒 ${pos.ticker} stop loss moved to -10% below entry (profit: +${pnlPct.toFixed(1)}%)`);
+          updated.stopLossPct = -20;
+          console.log(`🔒 ${pos.ticker} stop loss moved to -20% below entry (profit: +${pnlPct.toFixed(1)}%)`);
           await bot.telegram.sendMessage(CHAT_ID,
-            `🔒 *STOP LOSS UPGRADED*\n\n*Token:* $${escapeText(pos.ticker)}\n*Profit hit:* +${pnlPct.toFixed(1)}%\n*Stop loss moved to:* -10% below entry\n*Protected from:* full loss`,
+            `🔒 *STOP LOSS UPGRADED*\n\n*Token:* $${escapeText(pos.ticker)}\n*Profit hit:* +${pnlPct.toFixed(1)}%\n*Stop loss moved to:* -20% below entry\n*Protected from:* full loss`,
             { parse_mode: 'Markdown' }
           );
         }
@@ -316,7 +316,7 @@ async function monitorPositions() {
         }
 
         // ── STAGED TAKE PROFIT ──
-        // 60% at +100%, 15% at +250%, 15% at +500%, 10% at +900%
+        // 60% at +100%, 15% at +200%, 15% at +500%, 10% at +900%
         let tpMsg = '';
         let soldPct = 0;
 
@@ -327,7 +327,7 @@ async function monitorPositions() {
         } else if (pnlPct >= 250 && updated.remainingPct > 25) {
           soldPct = 15;
           updated.remainingPct = 25;
-          tpMsg = `🎯 *TAKE PROFIT 2 — +250%*\n• Sold: 15% of position\n• Remaining: 25%\n• Next TP: +500%`;
+          tpMsg = `🎯 *TAKE PROFIT 2 — +200%*\n• Sold: 15% of position\n• Remaining: 25%\n• Next TP: +500%`;
         } else if (pnlPct >= 500 && updated.remainingPct > 10) {
           soldPct = 15;
           updated.remainingPct = 10;
@@ -367,8 +367,8 @@ async function monitorPositions() {
           const pnlSol = (pos.sizeSol * (updated.remainingPct / 100) * pnlPct) / 100;
           const stopLabel =
             updated.stopLossLevel === 'trailing' ? '🔐 TRAILING STOP — +2% Above Entry' :
-            updated.stopLossLevel === 'breakeven' ? '🔒 DYNAMIC STOP — -10% Below Entry' :
-            '🛑 STOP LOSS — -20% Hit';
+            updated.stopLossLevel === 'breakeven' ? '🔒 DYNAMIC STOP — -20% Below Entry' :
+            '🛑 STOP LOSS — -30% Hit';
 
           const msg = [
             `💰 *POSITION CLOSED*`, ``,
@@ -558,7 +558,7 @@ async function scan() {
                   entryTime: Date.now(),
                   // ── Start with initial stop loss at -30% ──
                   stopLossLevel: 'initial',
-                  stopLossPct: -20,
+                  stopLossPct: -30,
                   remainingPct: 100,
                 });
                 console.log(`📌 Position opened: ${ticker} @ $${executedPrice}`);
