@@ -457,7 +457,7 @@ async function scan() {
           p.chainId === 'solana' &&
           isReversalCandidate(p) &&
           parseFloat(p.fdv || p.marketCap || '0') >= 1000 &&
-          parseFloat(p.fdv || p.marketCap || '0') <= 26000
+          parseFloat(p.fdv || p.marketCap || '0') <= 27000
         )
         .map((p: any) => ({ tokenAddress: p.baseToken.address, source: 'reversal', cachedPair: p }));
       console.log(`Reversals: ${reversalTokens.length}`);
@@ -505,12 +505,12 @@ async function scan() {
         const mcapMin = isNew ? 500 : 1000;
 
         // ── FIX 1: Soft skips do NOT add to seenTokens — token stays eligible for re-scan ──
-        if (mcap < mcapMin || mcap > 26000) continue;
+        if (mcap < mcapMin || mcap > 27000) continue;
 
         // ── Number 4: Time-alive filter — skip tokens under 7 minutes old (non-WSS only) ──
         if (!isNew && pair?.pairCreatedAt) {
           const ageMinutes = (Date.now() - pair.pairCreatedAt) / 60000;
-          if (ageMinutes < 50) {
+          if (ageMinutes < 40) {
             console.log(`⏭ ${ticker} too young: ${ageMinutes.toFixed(1)} mins old, skipping`);
             // ── FIX 1: Soft skip — do NOT add to seenTokens ──
             continue;
