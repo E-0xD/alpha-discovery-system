@@ -30,8 +30,7 @@ const riskEngine = new CapitalRiskEngine();
 const executor = new LowLatencyExecutionEngine();
 
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
-const DOMAIN = process.env.RENDER_EXTERNAL_URL || 'https://alpha-discovery-system.onrender.com';
-
+const DOMAIN = process.env.RAILWAY_STATIC_URL || process.env.RENDER_EXTERNAL_URL || 'https://alpha-discovery-system.onrender.com';
 const seenTokens = new Set<string>();
 const wssPumpTokensQueue: any[] = [];
 
