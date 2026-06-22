@@ -179,13 +179,23 @@ function isReversalCandidate(pair: any): boolean {
   const h24 = parseFloat(pair.priceChange?.h24 || '0');
   const h6 = parseFloat(pair.priceChange?.h6 || '0');
   const h1 = parseFloat(pair.priceChange?.h1 || '0');
-  const volH24 = parseFloat(pair.volume?.h24 || '0');
+  const m5 = parseFloat(pair.priceChange?.m5 || '0');
   const volH6 = parseFloat(pair.volume?.h6 || '0');
+  const volH1 = parseFloat(pair.volume?.h1 || '0');
+  const liquidity = parseFloat(pair.liquidity?.usd || '0');
+  const mcap = parseFloat(pair.fdv || pair.marketCap || '0');
+  const txBuys = pair.txns?.h1?.buys || 0;
+  const txSells = pair.txns?.h1?.sells || 0;
+
   const dumpedHard = h24 <= -50;
-  const recoveringH1 = h1 >= 5;
-  const recoveringH6 = h6 >= 10;
-  const volumeReturning = volH6 > 0 && volH24 > 0 && (volH6 / volH24) > 0.3;
-  return dumpedHard && (recoveringH1 || recoveringH6) && volumeReturning;
+  const earlyRecovery = h1 > 0 && h6 < 0;
+  const momentumNow = m5 >= 2;
+  const h6AvgPerHour = volH6 / 6;
+  const volumeAccelerating = volH1 > 0 && h6AvgPerHour > 0 && (volH1 / h6AvgPerHour) >= 1.5;
+  const liquidityHealthy = mcap > 0 && (liquidity / mcap) >= 0.10;
+  const buyPressure = txBuys > txSells;
+
+  return dumpedHard && earlyRecovery && momentumNow && volumeAccelerating && liquidityHealthy && buyPressure;
 }
 
 function startPumpPortalStream() {
