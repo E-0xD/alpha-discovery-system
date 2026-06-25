@@ -149,6 +149,7 @@ function getDynamicMode(score: number): string {
   return '⚡ ORGANIC';
 }
 
+// AFTER
 function computeAlphaScore(mcap: number, liquidity: number, rugProb: number): number {
   let score = 0;
   const ratio = liquidity / mcap;
@@ -157,9 +158,18 @@ function computeAlphaScore(mcap: number, liquidity: number, rugProb: number): nu
   else if (ratio >= 0.10) score += 20;
   else if (ratio >= 0.05) score += 10;
   if (mcap >= 1000 && mcap <= 40000) score += 25;
-  if (liquidity >= 20000) score += 20;
-  else if (liquidity >= 10000) score += 12;
-  else if (liquidity >= 5000) score += 8;
+
+  // ── Liquidity scoring: ratio bonus for $10k–$17k range, raw otherwise ──
+  if (mcap >= 10000 && mcap <= 17000) {
+    if (ratio >= 0.30) score += 20;
+    else if (ratio >= 0.20) score += 14;
+    else if (ratio >= 0.10) score += 7;
+  } else {
+    if (liquidity >= 25000) score += 20;
+    else if (liquidity >= 10000) score += 12;
+    else if (liquidity >= 5000) score += 6;
+  }
+
   if (rugProb <= 0.10) score += 15;
   else if (rugProb <= 0.20) score += 8;
   else if (rugProb >= 0.30) score -= 10;
@@ -179,23 +189,15 @@ function isReversalCandidate(pair: any): boolean {
   const h24 = parseFloat(pair.priceChange?.h24 || '0');
   const h6 = parseFloat(pair.priceChange?.h6 || '0');
   const h1 = parseFloat(pair.priceChange?.h1 || '0');
-  const m5 = parseFloat(pair.priceChange?.m5 || '0');
+  const volH24 = parseFloat(pair.volume?.h24 || '0');
   const volH6 = parseFloat(pair.volume?.h6 || '0');
-  const volH1 = parseFloat(pair.volume?.h1 || '0');
-  const liquidity = parseFloat(pair.liquidity?.usd || '0');
-  const mcap = parseFloat(pair.fdv || pair.marketCap || '0');
-  const txBuys = pair.txns?.h1?.buys || 0;
-  const txSells = pair.txns?.h1?.sells || 0;
-
   const dumpedHard = h24 <= -50;
-  const earlyRecovery = h1 > 0 && h6 < 0;
-  const momentumNow = m5 >= 2;
-  const h6AvgPerHour = volH6 / 6;
-  const volumeAccelerating = volH1 > 0 && h6AvgPerHour > 0 && (volH1 / h6AvgPerHour) >= 1.5;
-  const liquidityHealthy = mcap > 0 && (liquidity / mcap) >= 0.10;
-  const buyPressure = txBuys > txSells;
-
-  return dumpedHard && earlyRecovery && momentumNow && volumeAccelerating && liquidityHealthy && buyPressure;
+  // AFTER
+const recoveringH1 = h1 > 0;
+const stillDownH6 = h6 < 0;
+const volumeReturning = volH6 > 0 && volH24 > 0 && (volH6 / volH24) > 0.3;
+const dumpedHard = h24 <= -40;
+return dumpedHard && recoveringH1 && stillDownH6 && volumeReturning;
 }
 
 function startPumpPortalStream() {
