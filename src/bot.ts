@@ -191,7 +191,6 @@ function isReversalCandidate(pair: any): boolean {
   const h1 = parseFloat(pair.priceChange?.h1 || '0');
   const volH24 = parseFloat(pair.volume?.h24 || '0');
   const volH6 = parseFloat(pair.volume?.h6 || '0');
-  const dumpedHard = h24 <= -50;
   // AFTER
 const recoveringH1 = h1 > 0;
 const stillDownH6 = h6 < 0;
