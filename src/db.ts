@@ -87,6 +87,26 @@ export async function initDatabaseSchema() {
       );
     `);
 
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS wallet_settings (
+        chat_id TEXT PRIMARY KEY,
+        encrypted_key TEXT NOT NULL,
+        iv TEXT NOT NULL,
+        tag TEXT NOT NULL,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS bot_settings (
+        chat_id TEXT PRIMARY KEY,
+        trade_size_sol NUMERIC DEFAULT 0.15,
+        take_profit_pct NUMERIC DEFAULT 50,
+        stop_loss_pct NUMERIC DEFAULT 35,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
     console.log("⚡ Supabase Tables & High-Performance Schema Verified.");
   } catch (err) {
     console.error("❌ Database initialization failure:", err);
