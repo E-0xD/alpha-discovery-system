@@ -2,10 +2,14 @@ import { Telegraf, Markup } from 'telegraf';
 import * as dotenv from 'dotenv';
 import axios from 'axios';
 import WebSocket from 'ws';
+import { Keypair } from '@solana/web3.js';
+import bs58 from 'bs58';
 import { OnChainPatternRecognition } from './intelligence';
 import { CapitalRiskEngine } from './risk';
 import { LowLatencyExecutionEngine } from './execution';
 import { TokenSignal } from './types';
+import { saveEncryptedWallet, loadDecryptedWallet } from './wallet';
+import { saveSetting, loadSettings, BotSettings, DEFAULT_SETTINGS } from './settings';
 import Redis from 'ioredis';
 import { db, initDatabaseSchema } from './db';
 
@@ -33,6 +37,9 @@ const CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const DOMAIN = process.env.RAILWAY_STATIC_URL || process.env.RENDER_EXTERNAL_URL || 'https://alpha-discovery-system.onrender.com';
 const seenTokens = new Set<string>();
 const wssPumpTokensQueue: any[] = [];
+type AwaitingType = 'privateKey' | 'tradeSize' | 'tp' | 'sl';
+const awaitingInput = new Map<string, AwaitingType>();
+let botSettings: BotSettings = { ...DEFAULT_SETTINGS };
 
 interface Position {
   ticker: string;
@@ -306,44 +313,24 @@ async function monitorPositions() {
         const pnlPct = ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
         const holdingMins = Math.floor((now - pos.entryTime) / 60000);
 
-        // ── DYNAMIC TRAILING STOP LOSS ──
-        // Level 1: profit hits +30% → move stop loss to -20% below entry
-        if (pnlPct >= 30 && updated.stopLossLevel === 'initial') {
-          updated.stopLossLevel = 'breakeven';
-          updated.stopLossPct = -20;
-          console.log(`🔒 ${pos.ticker} stop loss moved to -20% below entry (profit: +${pnlPct.toFixed(1)}%)`);
-          await bot.telegram.sendMessage(CHAT_ID,
-            `🔒 *STOP LOSS UPGRADED*\n\n*Token:* $${escapeText(pos.ticker)}\n*Profit hit:* +${pnlPct.toFixed(1)}%\n*Stop loss moved to:* -20% below entry\n*Protected from:* full loss`,
-            { parse_mode: 'Markdown' }
-          );
-        }
+        const tp = botSettings.takeProfitPct;
+        const sl = botSettings.stopLossPct;
 
-        // Level 2: profit hits +60% → move stop loss to +2% above entry (locks in profit)
-        if (pnlPct >= 60 && updated.stopLossLevel === 'breakeven') {
-          updated.stopLossLevel = 'trailing';
-          updated.stopLossPct = 2;
-          console.log(`🔐 ${pos.ticker} stop loss locked to +2% above entry (profit: +${pnlPct.toFixed(1)}%)`);
-          await bot.telegram.sendMessage(CHAT_ID,
-            `🔐 *STOP LOSS LOCKED IN PROFIT*\n\n*Token:* $${escapeText(pos.ticker)}\n*Profit hit:* +${pnlPct.toFixed(1)}%\n*Stop loss moved to:* +2% above entry\n*This trade cannot lose now*`,
-            { parse_mode: 'Markdown' }
-          );
-        }
-
-        // ── TAKE PROFIT: sell everything at +50% ──
-        if (pnlPct >= 50 && updated.remainingPct > 0) {
+        // ── TAKE PROFIT ──
+        if (pnlPct >= tp) {
           const pnlSol = pos.sizeSol * (pnlPct / 100);
           const msg = [
-            `🎯 *TAKE PROFIT — +50% HIT*`, ``,
+            `🎯 *TAKE PROFIT — +${tp}% HIT*`, ``,
             `*Token:* $${escapeText(pos.ticker)}`,
             `*Entry:* $${pos.entryPrice.toFixed(8)}`,
             `*Exit:* $${currentPrice.toFixed(8)}`,
             `*PnL:* 🟢 +${pnlPct.toFixed(2)}%`,
             `*Profit:* +${pnlSol.toFixed(4)} SOL`,
-            `*Position fully closed.*`,
+            `*Held:* ${holdingMins} minutes`,
           ].join('\n');
           await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
           openPositions.delete(address);
-          console.log(`✅ Full exit at +50%: ${pos.ticker}`);
+          console.log(`✅ TP hit: ${pos.ticker} +${pnlPct.toFixed(1)}%`);
           if (alertHistory.has(address)) {
             const rec = alertHistory.get(address)!;
             alertHistory.set(address, {
@@ -358,32 +345,23 @@ async function monitorPositions() {
           return;
         }
 
-        // ── STOP LOSS CHECK — uses dynamic level ──
-        const stopLossPrice = pos.entryPrice * (1 + updated.stopLossPct / 100);
-        const stopLossHit = currentPrice <= stopLossPrice;
-
-        if (stopLossHit && updated.remainingPct > 0) {
-          const pnlSol = (pos.sizeSol * (updated.remainingPct / 100) * pnlPct) / 100;
-          const stopLabel =
-            updated.stopLossLevel === 'trailing' ? '🔐 TRAILING STOP — +2% Above Entry' :
-            updated.stopLossLevel === 'breakeven' ? '🔒 DYNAMIC STOP — -20% Below Entry' :
-            '🛑 STOP LOSS — -35% Hit';
-
+        // ── STOP LOSS ──
+        if (pnlPct <= -sl) {
+          const pnlSol = pos.sizeSol * (pnlPct / 100);
           const msg = [
-            `💰 *POSITION CLOSED*`, ``,
+            `🛑 *STOP LOSS — -${sl}% HIT*`, ``,
             `*Token:* $${escapeText(pos.ticker)}`,
             `*Address:* \`${address}\``, ``,
             `*Entry Price:* $${pos.entryPrice.toFixed(8)}`,
             `*Exit Price:* $${currentPrice.toFixed(8)}`,
-            `*PnL:* ${pnlPct >= 0 ? '🟢' : '🔴'} ${pnlPct.toFixed(2)}%`,
-            `*PnL in SOL:* ${pnlSol >= 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL`,
+            `*PnL:* 🔴 ${pnlPct.toFixed(2)}%`,
+            `*Loss:* ${pnlSol.toFixed(4)} SOL`,
             `*Size:* ${pos.sizeSol} SOL`,
-            `*Held:* ${holdingMins} minutes`, ``,
-            stopLabel,
+            `*Held:* ${holdingMins} minutes`,
           ].join('\n');
           await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
           openPositions.delete(address);
-          console.log(`✅ Closed via stop loss: ${pos.ticker} ${pnlPct.toFixed(1)}%`);
+          console.log(`✅ SL hit: ${pos.ticker} ${pnlPct.toFixed(1)}%`);
           if (alertHistory.has(address)) {
             const rec = alertHistory.get(address)!;
             alertHistory.set(address, {
@@ -549,15 +527,18 @@ async function scan() {
         let executedSizeSol = 0;
         let executedPrice = 0;
 
-        if (risk.allow) {
+        if (!executor.hasWallet()) {
+          executionState = `⚙️ No wallet — use /settings to enable auto\\-buy`;
+        } else if (risk.allow) {
           try {
-            const tx = await executor.buildJupiterSwapTransaction(address, risk.sizeSol, 'BUY');
+            const tradeSol = botSettings.tradeSizeSol;
+            const tx = await executor.buildJupiterSwapTransaction(address, tradeSol, 'BUY');
             tx.sign([executor.getWalletKeypair()]);
             const result = await executor.dispatchMevProtectedBundle(tx);
             if (result.success) {
               const txLink = result.bundleId ? ` — [Solscan](https://solscan.io/tx/${result.bundleId})` : '';
               executionState = `✅ Auto\\-Buy Executed${txLink}`;
-              executedSizeSol = risk.sizeSol;
+              executedSizeSol = tradeSol;
               executedPrice = currentPrice;
               if (executedPrice > 0) {
                 openPositions.set(address, {
@@ -566,7 +547,6 @@ async function scan() {
                   peakPrice: executedPrice,
                   sizeSol: executedSizeSol,
                   entryTime: Date.now(),
-                  // ── Start with initial stop loss at -35% ──
                   stopLossLevel: 'initial',
                   stopLossPct: -35,
                   remainingPct: 100,
@@ -604,7 +584,9 @@ async function scan() {
           await saveHistory();
         }
 
-        const walletShort = `${executor.getWalletPublicKey().slice(0, 8)}...${executor.getWalletPublicKey().slice(-4)}`;
+        const walletShort = executor.hasWallet()
+          ? `${executor.getWalletPublicKey().slice(0, 8)}...${executor.getWalletPublicKey().slice(-4)}`
+          : 'Not set — use /settings';
         const sourceLabel: Record<string, string> = {
           'pumpfun-new': '🆕 Pump\\.fun \\(Just Launched\\)',
           'dex-new': '⚡ New DEX Pair',
@@ -685,6 +667,27 @@ async function init() {
     console.log(`⚠️ alert_history table setup failed: ${e.message}`);
   }
 
+  // ✅ Load encrypted wallet + bot settings from DB
+  if (CHAT_ID) {
+    try {
+      const storedKey = await loadDecryptedWallet(CHAT_ID);
+      if (storedKey) {
+        const keypair = Keypair.fromSecretKey(bs58.decode(storedKey));
+        executor.setWallet(keypair);
+        console.log(`✅ Wallet loaded from DB: ${keypair.publicKey.toBase58().slice(0, 8)}...`);
+      }
+    } catch (e: any) {
+      console.log(`⚠️ Could not load wallet from DB: ${e.message}`);
+    }
+
+    try {
+      botSettings = await loadSettings(CHAT_ID);
+      console.log(`✅ Settings loaded — size: ${botSettings.tradeSizeSol} SOL | TP: ${botSettings.takeProfitPct}% | SL: ${botSettings.stopLossPct}%`);
+    } catch (e: any) {
+      console.log(`⚠️ Could not load settings from DB: ${e.message}`);
+    }
+  }
+
   await loadHistory();
 }
 
@@ -719,8 +722,7 @@ bot.command('positions', async (ctx) => {
     lines.push(`• $${escapeText(pos.ticker)} — ${pos.sizeSol} SOL — ${mins}m held`);
     lines.push(`  Entry: $${pos.entryPrice.toFixed(8)}`);
     lines.push(`  Peak: $${pos.peakPrice.toFixed(8)}`);
-    lines.push(`  Stop Loss: ${pos.stopLossPct >= 0 ? '+' : ''}${pos.stopLossPct}% (${pos.stopLossLevel})`);
-    lines.push(`  Remaining: ${pos.remainingPct}%`);
+    lines.push(`  Stop Loss: -${botSettings.stopLossPct}% | Take Profit: +${botSettings.takeProfitPct}%`);
     lines.push('');
   }
   ctx.reply(lines.join('\n'), { parse_mode: 'Markdown' });
@@ -1007,6 +1009,137 @@ bot.command('report', async (ctx) => {
     filename: `alpha-report-${new Date().toISOString().slice(0, 10)}.csv`
   });
   console.log(`📤 Report exported: ${alertHistory.size} trades`);
+});
+
+// ── Helper: build settings panel message + keyboard ──
+function buildSettingsMessage() {
+  const walletLine = executor.hasWallet()
+    ? `🟢 *Wallet:* \`${executor.getWalletPublicKey().slice(0, 8)}...${executor.getWalletPublicKey().slice(-4)}\``
+    : `🔴 *Wallet:* Not configured — auto\\-buy is disabled`;
+
+  const text = [
+    `⚙️ *Bot Settings*`, ``,
+    walletLine,
+    `💰 *Trade Size:* ${botSettings.tradeSizeSol} SOL per trade`,
+    `🎯 *Take Profit:* +${botSettings.takeProfitPct}%`,
+    `🛑 *Stop Loss:* \\-${botSettings.stopLossPct}%`,
+  ].join('\n');
+
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('🔑 Set Wallet Private Key', 'set_wallet_key')],
+    [Markup.button.callback('💰 Set Trade Size (SOL)', 'set_trade_size')],
+    [Markup.button.callback('🎯 Set Take Profit %', 'set_tp')],
+    [Markup.button.callback('🛑 Set Stop Loss %', 'set_sl')],
+  ]);
+
+  return { text, keyboard };
+}
+
+// ── /settings ──
+bot.command('settings', async (ctx) => {
+  const { text, keyboard } = buildSettingsMessage();
+  await ctx.reply(text, { parse_mode: 'Markdown', ...keyboard });
+});
+
+// ── Callbacks: each button puts the chat into an awaiting state ──
+bot.action('set_wallet_key', async (ctx) => {
+  await ctx.answerCbQuery();
+  awaitingInput.set(ctx.chat!.id.toString(), 'privateKey');
+  await ctx.reply(
+    `🔑 *Paste your Solana wallet private key* \\(base58\\) in the next message\\.\n\n` +
+    `⚠️ Your message will be deleted immediately after processing\\.\n` +
+    `🔒 The key is encrypted with AES\\-256\\-GCM before storage — never plain text\\.`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+bot.action('set_trade_size', async (ctx) => {
+  await ctx.answerCbQuery();
+  awaitingInput.set(ctx.chat!.id.toString(), 'tradeSize');
+  await ctx.reply(
+    `💰 *Enter trade size in SOL*\n\nExample: \`0.15\` or \`0.5\`\n\nCurrent: *${botSettings.tradeSizeSol} SOL*`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+bot.action('set_tp', async (ctx) => {
+  await ctx.answerCbQuery();
+  awaitingInput.set(ctx.chat!.id.toString(), 'tp');
+  await ctx.reply(
+    `🎯 *Enter Take Profit percentage*\n\nExample: \`50\` closes the trade at \\+50%\n\nCurrent: *${botSettings.takeProfitPct}%*`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+bot.action('set_sl', async (ctx) => {
+  await ctx.answerCbQuery();
+  awaitingInput.set(ctx.chat!.id.toString(), 'sl');
+  await ctx.reply(
+    `🛑 *Enter Stop Loss percentage*\n\nExample: \`35\` closes the trade if it drops \\-35% from entry\n\nCurrent: *${botSettings.stopLossPct}%*`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+// ── Text handler: routes input to the correct setting ──
+bot.on('text', async (ctx) => {
+  const chatId = ctx.chat.id.toString();
+  const waiting = awaitingInput.get(chatId);
+  if (!waiting) return;
+
+  awaitingInput.delete(chatId);
+  const input = ctx.message.text.trim();
+
+  if (waiting === 'privateKey') {
+    try { await ctx.deleteMessage(); } catch {}
+    try {
+      const keyBytes = bs58.decode(input);
+      if (keyBytes.length !== 64) throw new Error(`Expected 64-byte key, got ${keyBytes.length}`);
+      const keypair = Keypair.fromSecretKey(keyBytes);
+      const publicKey = keypair.publicKey.toBase58();
+      await saveEncryptedWallet(chatId, input);
+      executor.setWallet(keypair);
+      await ctx.reply(
+        `✅ *Wallet Set*\n\n*Public Key:* \`${publicKey}\`\n\nAuto\\-buy is now enabled\\.`,
+        { parse_mode: 'Markdown' }
+      );
+      console.log(`✅ Wallet set via /settings: ${publicKey.slice(0, 8)}...`);
+    } catch (e: any) {
+      await ctx.reply(`❌ *Invalid private key*\n\n${escapeText(e.message)}\n\nTry again with /settings`, { parse_mode: 'Markdown' });
+    }
+    return;
+  }
+
+  const value = parseFloat(input);
+  if (isNaN(value) || value <= 0) {
+    await ctx.reply(`❌ Invalid value — enter a positive number\\.`, { parse_mode: 'Markdown' });
+    return;
+  }
+
+  if (waiting === 'tradeSize') {
+    if (value > 10) {
+      await ctx.reply(`❌ Trade size capped at 10 SOL for safety\\.`, { parse_mode: 'Markdown' });
+      return;
+    }
+    botSettings.tradeSizeSol = value;
+    await saveSetting(chatId, 'tradeSizeSol', value);
+    await ctx.reply(`✅ *Trade size set to ${value} SOL per trade*`, { parse_mode: 'Markdown' });
+  } else if (waiting === 'tp') {
+    if (value > 1000) {
+      await ctx.reply(`❌ Take profit capped at 1000%\\.`, { parse_mode: 'Markdown' });
+      return;
+    }
+    botSettings.takeProfitPct = value;
+    await saveSetting(chatId, 'takeProfitPct', value);
+    await ctx.reply(`✅ *Take profit set to +${value}%*`, { parse_mode: 'Markdown' });
+  } else if (waiting === 'sl') {
+    if (value > 100) {
+      await ctx.reply(`❌ Stop loss capped at 100%\\.`, { parse_mode: 'Markdown' });
+      return;
+    }
+    botSettings.stopLossPct = value;
+    await saveSetting(chatId, 'stopLossPct', value);
+    await ctx.reply(`✅ *Stop loss set to \\-${value}%*`, { parse_mode: 'Markdown' });
+  }
 });
 
 // ✅ Heartbeat — console only, NOT Telegram

@@ -41,7 +41,7 @@ const SELL_DISCRIMINATOR = Buffer.from([51, 230, 133, 164, 1, 127, 131, 173]);
 export class LowLatencyExecutionEngine {
   private jupiterUrl = process.env.QUICKNODE_JUPITER_URL || 'https://quote-api.jup.ag/v6';
   private jitoBundleEndpoint = 'https://ny.mainnet.block-engine.jito.wtf/api/v1/bundles';
-  private wallet: Keypair;
+  private wallet: Keypair | null = null;
 
   private client = axios.create({
     httpsAgent: new https.Agent({ family: 4 }),
@@ -53,15 +53,34 @@ export class LowLatencyExecutionEngine {
 
   constructor() {
     const keyString = process.env.WALLET_PRIVATE_KEY || process.env.SOLANA_WALLET_PRIVATE_KEY || '';
-    if (!keyString) throw new Error("CRITICAL: WALLET_PRIVATE_KEY environment string is missing.");
-    this.wallet = Keypair.fromSecretKey(bs58.decode(keyString));
+    if (keyString) {
+      try {
+        this.wallet = Keypair.fromSecretKey(bs58.decode(keyString));
+        console.log(`🔑 Wallet loaded from env: ${this.wallet.publicKey.toBase58().slice(0, 8)}...`);
+      } catch {
+        console.log('⚠️ Invalid WALLET_PRIVATE_KEY in env — wallet not loaded from env');
+      }
+    } else {
+      console.log('⚠️ No WALLET_PRIVATE_KEY in env — auto-buy disabled until wallet set via /settings');
+    }
+  }
+
+  public hasWallet(): boolean {
+    return this.wallet !== null;
+  }
+
+  public setWallet(keypair: Keypair): void {
+    this.wallet = keypair;
+    console.log(`🔑 Wallet updated: ${keypair.publicKey.toBase58().slice(0, 8)}...`);
   }
 
   public getWalletPublicKey(): string {
+    if (!this.wallet) throw new Error('No wallet loaded');
     return this.wallet.publicKey.toBase58();
   }
 
   public getWalletKeypair(): Keypair {
+    if (!this.wallet) throw new Error('No wallet loaded');
     return this.wallet;
   }
 
@@ -172,7 +191,7 @@ export class LowLatencyExecutionEngine {
       { pubkey: bondingCurve,                 isSigner: false, isWritable: true  },
       { pubkey: associatedBondingCurve,       isSigner: false, isWritable: true  },
       { pubkey: userTokenAccount,             isSigner: false, isWritable: true  },
-      { pubkey: this.wallet.publicKey,        isSigner: true,  isWritable: true  },
+      { pubkey: this.wallet!.publicKey,        isSigner: true,  isWritable: true  },
       { pubkey: SYSTEM_PROGRAM_ID,            isSigner: false, isWritable: false },
       { pubkey: TOKEN_PROGRAM_ID,             isSigner: false, isWritable: false },
       { pubkey: SYSVAR_RENT,                  isSigner: false, isWritable: false },
@@ -205,7 +224,7 @@ export class LowLatencyExecutionEngine {
       { pubkey: bondingCurve,                 isSigner: false, isWritable: true  },
       { pubkey: associatedBondingCurve,       isSigner: false, isWritable: true  },
       { pubkey: userTokenAccount,             isSigner: false, isWritable: true  },
-      { pubkey: this.wallet.publicKey,        isSigner: true,  isWritable: true  },
+      { pubkey: this.wallet!.publicKey,        isSigner: true,  isWritable: true  },
       { pubkey: SYSTEM_PROGRAM_ID,            isSigner: false, isWritable: false },
       { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID,  isSigner: false, isWritable: false },
       { pubkey: TOKEN_PROGRAM_ID,             isSigner: false, isWritable: false },
@@ -225,6 +244,7 @@ export class LowLatencyExecutionEngine {
     const mint = new PublicKey(tokenAddress);
     const bondingCurve = this.deriveBondingCurve(mint);
     const associatedBondingCurve = this.deriveAssociatedBondingCurve(mint, bondingCurve);
+    if (!this.wallet) throw new Error('No wallet configured. Use /settings to set your wallet.');
     const userTokenAccount = this.deriveUserTokenAccount(mint, this.wallet.publicKey);
 
     const solLamports = BigInt(Math.floor(solAmount * LAMPORTS_PER_SOL));
@@ -245,7 +265,7 @@ export class LowLatencyExecutionEngine {
 
     const tx = new Transaction();
     tx.recentBlockhash = blockhash;
-    tx.feePayer = this.wallet.publicKey;
+    tx.feePayer = this.wallet!.publicKey;
 
     if (direction === 'BUY') {
       // 25% slippage buffer for fast-moving tokens
@@ -270,7 +290,7 @@ export class LowLatencyExecutionEngine {
       ));
     }
 
-    tx.sign(this.wallet);
+    tx.sign(this.wallet!);
 
     // ── Convert legacy Transaction to VersionedTransaction for unified dispatch ──
     const serialized = tx.serialize();
@@ -278,6 +298,7 @@ export class LowLatencyExecutionEngine {
   }
 
   public async buildJupiterSwapTransaction(outputMint: string, solAmount: number, direction: 'BUY' | 'SELL'): Promise<VersionedTransaction> {
+    if (!this.wallet) throw new Error('No wallet configured. Use /settings to set your wallet.');
     const wsolMint = 'So11111111111111111111111111111111111111112';
     const inputMint = direction === 'BUY' ? wsolMint : outputMint;
     const targetOutputMint = direction === 'BUY' ? outputMint : wsolMint;
@@ -297,7 +318,7 @@ export class LowLatencyExecutionEngine {
 
     const swapTxRes = await this.client.post(`${this.jupiterUrl}/swap`, {
       quoteResponse: quoteRes.data,
-      userPublicKey: this.wallet.publicKey.toBase58(),
+      userPublicKey: this.wallet!.publicKey.toBase58(),
       wrapAndUnwrapSol: true,
       prioritizationFeeLamports: {
         priorityLevelWithMaxLamports: {
@@ -321,16 +342,16 @@ export class LowLatencyExecutionEngine {
 
     const tipTx = new Transaction();
     tipTx.recentBlockhash = blockhash;
-    tipTx.feePayer = this.wallet.publicKey;
+    tipTx.feePayer = this.wallet!.publicKey;
     tipTx.add(
       SystemProgram.transfer({
-        fromPubkey: this.wallet.publicKey,
+        fromPubkey: this.wallet!.publicKey,
         toPubkey: tipAccount,
         lamports: tipLamports,
       })
     );
 
-    tipTx.sign(this.wallet);
+    tipTx.sign(this.wallet!);
     return tipTx;
   }
 
