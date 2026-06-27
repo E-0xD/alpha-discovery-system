@@ -326,10 +326,10 @@ async function monitorPositions() {
         }
 
         // ── TAKE PROFIT: sell everything at +70% ──
-        if (pnlPct >= 70 && updated.remainingPct > 0) {
+        if (pnlPct >= 50 && updated.remainingPct > 0) {
           const pnlSol = pos.sizeSol * (pnlPct / 100);
           const msg = [
-            `🎯 *TAKE PROFIT — +70% HIT*`, ``,
+            `🎯 *TAKE PROFIT — +50% HIT*`, ``,
             `*Token:* $${escapeText(pos.ticker)}`,
             `*Entry:* $${pos.entryPrice.toFixed(8)}`,
             `*Exit:* $${currentPrice.toFixed(8)}`,
@@ -339,7 +339,7 @@ async function monitorPositions() {
           ].join('\n');
           await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
           openPositions.delete(address);
-          console.log(`✅ Full exit at +70%: ${pos.ticker}`);
+          console.log(`✅ Full exit at +50%: ${pos.ticker}`);
           return;
         }
 
