@@ -103,9 +103,11 @@ export async function initDatabaseSchema() {
         trade_size_sol NUMERIC DEFAULT 0.15,
         take_profit_pct NUMERIC DEFAULT 50,
         stop_loss_pct NUMERIC DEFAULT 35,
+        delayed_entry_enabled BOOLEAN DEFAULT FALSE,
         updated_at TIMESTAMPTZ DEFAULT NOW()
       );
     `);
+    await db.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS delayed_entry_enabled BOOLEAN DEFAULT FALSE`);
 
     console.log("⚡ Supabase Tables & High-Performance Schema Verified.");
   } catch (err) {

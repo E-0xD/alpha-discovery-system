@@ -100,6 +100,14 @@ interface Position {
 }
 const openPositions = new Map<string, Position>();
 
+// ── Delayed entry: alert fires immediately, auto-buy waits for this mcap ──
+const DELAYED_ENTRY_MCAP_THRESHOLD = 15000;
+interface PendingEntry {
+  ticker: string;
+  address: string;
+}
+const pendingEntries = new Map<string, PendingEntry>();
+
 interface AlertRecord {
   ticker: string;
   address: string;
@@ -357,13 +365,55 @@ async function monitorPositions() {
     return rec && (now - rec.alertTime) < TWENTY_FOUR_HOURS;
   });
 
-  const allAddresses = new Set([...openPositions.keys(), ...recentAlerts]);
+  // Drop pending entries whose alert has aged out of the 24h tracking window
+  for (const addr of pendingEntries.keys()) {
+    if (!recentAlerts.includes(addr)) pendingEntries.delete(addr);
+  }
+
+  const allAddresses = new Set([...openPositions.keys(), ...recentAlerts, ...pendingEntries.keys()]);
   if (allAddresses.size === 0) return;
 
   await Promise.all(Array.from(allAddresses).map(async (address) => {
     try {
       const { price: currentPrice, mcap: currentMcap } = await getLivePrice(address);
       if (!currentPrice) return;
+
+      if (pendingEntries.has(address) && currentMcap >= DELAYED_ENTRY_MCAP_THRESHOLD) {
+        const pending = pendingEntries.get(address)!;
+        pendingEntries.delete(address);
+        if (executor.hasWallet()) {
+          try {
+            const tradeSol = botSettings.tradeSizeSol;
+            const tx = await executor.buildJupiterSwapTransaction(address, tradeSol, 'BUY');
+            tx.sign([executor.getWalletKeypair()]);
+            const result = await executor.dispatchMevProtectedBundle(tx);
+            if (result.success && currentPrice > 0) {
+              openPositions.set(address, {
+                ticker: pending.ticker, address,
+                entryPrice: currentPrice,
+                peakPrice: currentPrice,
+                sizeSol: tradeSol,
+                entryTime: now,
+                stopLossLevel: 'initial',
+                stopLossPct: -35,
+                remainingPct: 100,
+              });
+              const txLink = result.bundleId ? ` — [Solscan](https://solscan.io/tx/${result.bundleId})` : '';
+              await bot.telegram.sendMessage(CHAT_ID, [
+                `⏳➡️✅ *DELAYED ENTRY EXECUTED*`, ``,
+                `*Token:* $${escapeText(pending.ticker)}`,
+                `*Entry:* $${currentPrice.toFixed(8)} — MCAP $${currentMcap.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
+                `*Size:* ${tradeSol} SOL${txLink}`,
+              ].join('\n'), { parse_mode: 'Markdown' });
+              console.log(`📌 Delayed entry executed: ${pending.ticker} @ $${currentPrice} (mcap $${currentMcap})`);
+            } else {
+              console.log(`❌ Delayed entry buy failed for ${pending.ticker}: ${result.error || 'unknown error'}`);
+            }
+          } catch (e: any) {
+            console.log(`❌ Delayed entry error for ${pending.ticker}: ${e.message}`);
+          }
+        }
+      }
 
       if (alertHistory.has(address)) {
         const rec = alertHistory.get(address)!;
@@ -605,38 +655,44 @@ async function scan() {
         if (!executor.hasWallet()) {
           executionState = `⚙️ No wallet — use /settings to enable auto\\-buy`;
         } else if (risk.allow) {
-          try {
-            const tradeSol = botSettings.tradeSizeSol;
-            const tx = await executor.buildJupiterSwapTransaction(address, tradeSol, 'BUY');
-            tx.sign([executor.getWalletKeypair()]);
-            const result = await executor.dispatchMevProtectedBundle(tx);
-            if (result.success) {
-              const txLink = result.bundleId ? ` — [Solscan](https://solscan.io/tx/${result.bundleId})` : '';
-              executionState = `✅ Auto\\-Buy Executed${txLink}`;
-              executedSizeSol = tradeSol;
-              executedPrice = currentPrice;
-              if (executedPrice > 0) {
-                openPositions.set(address, {
-                  ticker, address,
-                  entryPrice: executedPrice,
-                  peakPrice: executedPrice,
-                  sizeSol: executedSizeSol,
-                  entryTime: Date.now(),
-                  stopLossLevel: 'initial',
-                  stopLossPct: -35,
-                  remainingPct: 100,
-                });
-                console.log(`📌 Position opened: ${ticker} @ $${executedPrice}`);
+          // ── Delayed entry: alert now, but hold the auto-buy until mcap reaches the threshold ──
+          if (botSettings.delayedEntryEnabled && mcap < DELAYED_ENTRY_MCAP_THRESHOLD) {
+            pendingEntries.set(address, { ticker, address });
+            executionState = `⏳ Delayed Entry Armed — waiting for $${DELAYED_ENTRY_MCAP_THRESHOLD.toLocaleString('en-US')} MCAP \\(currently $${mcap.toLocaleString('en-US', { maximumFractionDigits: 0 })}\\)`;
+          } else {
+            try {
+              const tradeSol = botSettings.tradeSizeSol;
+              const tx = await executor.buildJupiterSwapTransaction(address, tradeSol, 'BUY');
+              tx.sign([executor.getWalletKeypair()]);
+              const result = await executor.dispatchMevProtectedBundle(tx);
+              if (result.success) {
+                const txLink = result.bundleId ? ` — [Solscan](https://solscan.io/tx/${result.bundleId})` : '';
+                executionState = `✅ Auto\\-Buy Executed${txLink}`;
+                executedSizeSol = tradeSol;
+                executedPrice = currentPrice;
+                if (executedPrice > 0) {
+                  openPositions.set(address, {
+                    ticker, address,
+                    entryPrice: executedPrice,
+                    peakPrice: executedPrice,
+                    sizeSol: executedSizeSol,
+                    entryTime: Date.now(),
+                    stopLossLevel: 'initial',
+                    stopLossPct: -35,
+                    remainingPct: 100,
+                  });
+                  console.log(`📌 Position opened: ${ticker} @ $${executedPrice}`);
+                }
+              } else {
+                executionState = `❌ Auto\\-Buy Failed: ${escapeText(result.error || '')}`;
               }
-            } else {
-              executionState = `❌ Auto\\-Buy Failed: ${escapeText(result.error || '')}`;
+            } catch (execErr: any) {
+              console.log("🔥 AUTO-BUY REJECTION REASON:", JSON.stringify(execErr.response?.data || execErr.message));
+              const isNetworkErr = execErr.message?.includes('ENOTFOUND') || execErr.message?.includes('ECONNREFUSED');
+              executionState = isNetworkErr
+                ? `⏸ Execution Paused: Jupiter unreachable on free tier`
+                : `❌ Execution Blocked: ${escapeText(execErr.message)}`;
             }
-          } catch (execErr: any) {
-            console.log("🔥 AUTO-BUY REJECTION REASON:", JSON.stringify(execErr.response?.data || execErr.message));
-            const isNetworkErr = execErr.message?.includes('ENOTFOUND') || execErr.message?.includes('ECONNREFUSED');
-            executionState = isNetworkErr
-              ? `⏸ Execution Paused: Jupiter unreachable on free tier`
-              : `❌ Execution Blocked: ${escapeText(execErr.message)}`;
           }
         } else {
           executionState = `❌ Auto\\-Buy Blocked: ${escapeText(risk.reason || '')}`;
@@ -798,7 +854,7 @@ bot.launch({
 bot.command('test', (ctx) => ctx.reply('✅ Bot online. Scanning pump.fun (via WSS) + PumpSwap + Early Detection + Reversals.'));
 
 bot.command('positions', async (ctx) => {
-  if (openPositions.size === 0) return ctx.reply('📭 No open positions.');
+  if (openPositions.size === 0 && pendingEntries.size === 0) return ctx.reply('📭 No open positions.');
   const lines = ['📊 *Open Positions:*', ''];
   for (const [address, pos] of openPositions.entries()) {
     const mins = Math.floor((Date.now() - pos.entryTime) / 60000);
@@ -806,6 +862,13 @@ bot.command('positions', async (ctx) => {
     lines.push(`  Entry: $${pos.entryPrice.toFixed(8)}`);
     lines.push(`  Peak: $${pos.peakPrice.toFixed(8)}`);
     lines.push(`  Stop Loss: -${botSettings.stopLossPct}% | Take Profit: +${botSettings.takeProfitPct}%`);
+    lines.push('');
+  }
+  if (pendingEntries.size > 0) {
+    lines.push(`⏳ *Waiting for $${DELAYED_ENTRY_MCAP_THRESHOLD.toLocaleString('en-US')} MCAP:*`, '');
+    for (const pending of pendingEntries.values()) {
+      lines.push(`• $${escapeText(pending.ticker)}`);
+    }
     lines.push('');
   }
   ctx.reply(lines.join('\n'), { parse_mode: 'Markdown' });
@@ -1106,6 +1169,7 @@ function buildSettingsMessage() {
     `💰 *Trade Size:* ${botSettings.tradeSizeSol} SOL per trade`,
     `🎯 *Take Profit:* +${botSettings.takeProfitPct}%`,
     `🛑 *Stop Loss:* \\-${botSettings.stopLossPct}%`,
+    `⏳ *Delayed Entry \\($${DELAYED_ENTRY_MCAP_THRESHOLD.toLocaleString('en-US')} MCAP\\):* ${botSettings.delayedEntryEnabled ? '✅ ON' : '❌ OFF'}`,
   ].join('\n');
 
   const keyboard = Markup.inlineKeyboard([
@@ -1113,6 +1177,10 @@ function buildSettingsMessage() {
     [Markup.button.callback('💰 Set Trade Size (SOL)', 'set_trade_size')],
     [Markup.button.callback('🎯 Set Take Profit %', 'set_tp')],
     [Markup.button.callback('🛑 Set Stop Loss %', 'set_sl')],
+    [Markup.button.callback(
+      botSettings.delayedEntryEnabled ? '⏳ Delayed Entry: ON (tap to disable)' : '⏳ Delayed Entry: OFF (tap to enable)',
+      'toggle_delayed_entry'
+    )],
   ]);
 
   return { text, keyboard };
@@ -1132,6 +1200,15 @@ bot.command('cancel', async (ctx) => {
   }
   clearAwaiting(chatId);
   await ctx.reply('❌ Cancelled.');
+});
+
+// ── Toggle delayed entry: alert immediately, hold the auto-buy until $15k MCAP ──
+bot.action('toggle_delayed_entry', async (ctx) => {
+  await ctx.answerCbQuery();
+  botSettings.delayedEntryEnabled = !botSettings.delayedEntryEnabled;
+  await saveSetting(ctx.chat!.id.toString(), 'delayedEntryEnabled', botSettings.delayedEntryEnabled);
+  const { text, keyboard } = buildSettingsMessage();
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...keyboard });
 });
 
 // ── Callbacks: each button puts the chat into an awaiting state ──
