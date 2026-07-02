@@ -17,6 +17,15 @@ const redis = new Redis(process.env.REDIS_URL || '');
 
 dotenv.config();
 
+// ── Finding 4: fail fast at startup instead of failing silently minutes later ──
+const REQUIRED_ENV_VARS = ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID', 'DATABASE_URL'];
+for (const key of REQUIRED_ENV_VARS) {
+  if (!process.env[key]?.trim()) {
+    console.error(`❌ Missing required environment variable: ${key}`);
+    process.exit(1);
+  }
+}
+
 const PORT = Number(process.env.PORT) || 10000;
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN || '');
@@ -36,10 +45,46 @@ const executor = new LowLatencyExecutionEngine();
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const DOMAIN = process.env.RAILWAY_STATIC_URL || process.env.RENDER_EXTERNAL_URL || 'https://alpha-discovery-system.onrender.com';
 const seenTokens = new Set<string>();
+const seenTokensQueue: string[] = [];
 const wssPumpTokensQueue: any[] = [];
 type AwaitingType = 'privateKey' | 'tradeSize' | 'tp' | 'sl';
 const awaitingInput = new Map<string, AwaitingType>();
+const awaitingTimers = new Map<string, NodeJS.Timeout>();
+const AWAITING_TIMEOUT_MS = 5 * 60 * 1000;
 let botSettings: BotSettings = { ...DEFAULT_SETTINGS };
+
+// ── Finding 2: FIFO-bounded dedup — evicts only the oldest entry instead of wiping the whole set ──
+function markSeen(address: string) {
+  if (seenTokens.has(address)) return;
+  seenTokens.add(address);
+  seenTokensQueue.push(address);
+  if (seenTokensQueue.length > 500) {
+    const oldest = seenTokensQueue.shift()!;
+    seenTokens.delete(oldest);
+  }
+}
+
+// ── Finding 8: settings prompts auto-expire and can be cancelled ──
+function setAwaiting(chatId: string, type: AwaitingType) {
+  const existing = awaitingTimers.get(chatId);
+  if (existing) clearTimeout(existing);
+  awaitingInput.set(chatId, type);
+  const timer = setTimeout(async () => {
+    awaitingInput.delete(chatId);
+    awaitingTimers.delete(chatId);
+    try {
+      await bot.telegram.sendMessage(chatId, '⌛ Settings input timed out — use /settings to try again.');
+    } catch {}
+  }, AWAITING_TIMEOUT_MS);
+  awaitingTimers.set(chatId, timer);
+}
+
+function clearAwaiting(chatId: string) {
+  const existing = awaitingTimers.get(chatId);
+  if (existing) clearTimeout(existing);
+  awaitingTimers.delete(chatId);
+  awaitingInput.delete(chatId);
+}
 
 interface Position {
   ticker: string;
@@ -73,6 +118,13 @@ interface AlertRecord {
   exitTime?: number;
 }
 let alertHistory = new Map<string, AlertRecord>();
+// ── Finding 6: only addresses touched since the last save get upserted to Postgres ──
+const dirtyAddresses = new Set<string>();
+
+function setAlert(address: string, rec: AlertRecord) {
+  alertHistory.set(address, rec);
+  dirtyAddresses.add(address);
+}
 
 // ✅ Load history from Redis first, then Supabase as fallback
 async function loadHistory() {
@@ -91,7 +143,8 @@ async function loadHistory() {
   try {
     const result = await db.query(`
       SELECT address, ticker, alert_time, alert_mcap, alert_price,
-             peak_mcap, peak_price, peak_time, current_mcap, current_price, last_updated
+             peak_mcap, peak_price, peak_time, current_mcap, current_price, last_updated,
+             exit_reason, exit_price, exit_mcap, exit_time
       FROM alert_history ORDER BY alert_time DESC LIMIT 500
     `);
     for (const row of result.rows) {
@@ -102,11 +155,16 @@ async function loadHistory() {
         alertMcap: Number(row.alert_mcap),
         alertPrice: Number(row.alert_price),
         peakMcap: Number(row.peak_mcap),
-        peakPrice: Number(row.peak_price),
+        // ── Finding 10: NULL peak_price falls back to alert_price, not 0 ──
+        peakPrice: Number(row.peak_price) || Number(row.alert_price) || 0,
         peakTime: Number(row.peak_time),
         currentMcap: Number(row.current_mcap),
         currentPrice: Number(row.current_price),
-        lastUpdated: Number(row.last_updated)
+        lastUpdated: Number(row.last_updated),
+        exitReason: row.exit_reason || undefined,
+        exitPrice: row.exit_price != null ? Number(row.exit_price) : undefined,
+        exitMcap: row.exit_mcap != null ? Number(row.exit_mcap) : undefined,
+        exitTime: row.exit_time != null ? Number(row.exit_time) : undefined
       });
     }
     console.log(`✅ History loaded from Supabase: ${alertHistory.size} records`);
@@ -115,23 +173,31 @@ async function loadHistory() {
   }
 }
 
-// ✅ Save to both Redis and Supabase
+// ✅ Save to both Redis and Supabase — only dirty records hit Postgres
 async function saveHistory() {
-  // Redis save
+  // Redis save — full snapshot, cheap as a single write
   try {
     await redis.set('bot_history', JSON.stringify(Array.from(alertHistory.entries())));
   } catch (e: any) {
     console.log(`⚠️ Redis save failed: ${e.message}`);
   }
 
-  // Supabase save — upsert so peaks update but alertTime never changes
-  try {
-    for (const rec of alertHistory.values()) {
+  if (dirtyAddresses.size === 0) return;
+
+  // Supabase save — upsert only what changed since the last save
+  for (const address of Array.from(dirtyAddresses)) {
+    const rec = alertHistory.get(address);
+    if (!rec) {
+      dirtyAddresses.delete(address);
+      continue;
+    }
+    try {
       await db.query(`
         INSERT INTO alert_history (
           address, ticker, alert_time, alert_mcap, alert_price,
-          peak_mcap, peak_price, peak_time, current_mcap, current_price, last_updated
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+          peak_mcap, peak_price, peak_time, current_mcap, current_price, last_updated,
+          exit_reason, exit_price, exit_mcap, exit_time
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
         ON CONFLICT (address) DO UPDATE SET
           peak_mcap = GREATEST(alert_history.peak_mcap, EXCLUDED.peak_mcap),
           peak_price = GREATEST(alert_history.peak_price, EXCLUDED.peak_price),
@@ -139,14 +205,20 @@ async function saveHistory() {
                      THEN EXCLUDED.peak_time ELSE alert_history.peak_time END,
           current_mcap = EXCLUDED.current_mcap,
           current_price = EXCLUDED.current_price,
-          last_updated = EXCLUDED.last_updated
+          last_updated = EXCLUDED.last_updated,
+          exit_reason = EXCLUDED.exit_reason,
+          exit_price = EXCLUDED.exit_price,
+          exit_mcap = EXCLUDED.exit_mcap,
+          exit_time = EXCLUDED.exit_time
       `, [
         rec.address, rec.ticker, rec.alertTime, rec.alertMcap, rec.alertPrice,
-        rec.peakMcap, rec.peakPrice, rec.peakTime, rec.currentMcap, rec.currentPrice, rec.lastUpdated
+        rec.peakMcap, rec.peakPrice, rec.peakTime, rec.currentMcap, rec.currentPrice, rec.lastUpdated,
+        rec.exitReason || null, rec.exitPrice ?? null, rec.exitMcap ?? null, rec.exitTime ?? null
       ]);
+      dirtyAddresses.delete(address);
+    } catch (e: any) {
+      console.log(`⚠️ Supabase save failed for ${address}: ${e.message}`);
     }
-  } catch (e: any) {
-    console.log(`⚠️ Supabase save failed: ${e.message}`);
   }
 }
 
@@ -302,7 +374,7 @@ async function monitorPositions() {
           updated.peakTime = now;
           console.log(`📈 New peak ${rec.ticker}: $${currentPrice.toFixed(8)} (+${(((currentPrice - rec.alertPrice) / rec.alertPrice) * 100).toFixed(1)}%)`);
         }
-        alertHistory.set(address, updated);
+        setAlert(address, updated);
       }
 
       if (openPositions.has(address)) {
@@ -328,12 +400,10 @@ async function monitorPositions() {
             `*Profit:* +${pnlSol.toFixed(4)} SOL`,
             `*Held:* ${holdingMins} minutes`,
           ].join('\n');
-          await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
-          openPositions.delete(address);
-          console.log(`✅ TP hit: ${pos.ticker} +${pnlPct.toFixed(1)}%`);
+          // ── Finding 7: persist the exit before mutating in-memory state, so a crash never loses the trade ──
           if (alertHistory.has(address)) {
             const rec = alertHistory.get(address)!;
-            alertHistory.set(address, {
+            setAlert(address, {
               ...rec,
               exitReason: 'TP',
               exitPrice: currentPrice,
@@ -342,6 +412,9 @@ async function monitorPositions() {
             });
             await saveHistory();
           }
+          openPositions.delete(address);
+          await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
+          console.log(`✅ TP hit: ${pos.ticker} +${pnlPct.toFixed(1)}%`);
           return;
         }
 
@@ -359,12 +432,10 @@ async function monitorPositions() {
             `*Size:* ${pos.sizeSol} SOL`,
             `*Held:* ${holdingMins} minutes`,
           ].join('\n');
-          await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
-          openPositions.delete(address);
-          console.log(`✅ SL hit: ${pos.ticker} ${pnlPct.toFixed(1)}%`);
+          // ── Finding 7: persist the exit before mutating in-memory state, so a crash never loses the trade ──
           if (alertHistory.has(address)) {
             const rec = alertHistory.get(address)!;
-            alertHistory.set(address, {
+            setAlert(address, {
               ...rec,
               exitReason: 'SL',
               exitPrice: currentPrice,
@@ -373,6 +444,9 @@ async function monitorPositions() {
             });
             await saveHistory();
           }
+          openPositions.delete(address);
+          await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
+          console.log(`✅ SL hit: ${pos.ticker} ${pnlPct.toFixed(1)}%`);
           return;
         }
 
@@ -453,16 +527,17 @@ async function scan() {
 
     for (const p of prioritized.slice(0, 40)) {
       try {
-        await new Promise(resolve => setTimeout(resolve, 800));
         if (seenTokens.has(p.tokenAddress)) continue;
 
         let pair = p.cachedPair || null;
         if (!pair) {
+          // ── Finding 9: rate-limit delay only applies to tokens that actually hit the DexScreener API ──
+          await new Promise(resolve => setTimeout(resolve, 800));
           try {
             const { data } = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${p.tokenAddress}`, { timeout: 8000 });
             pair = data?.pairs?.[0];
           } catch {
-            seenTokens.add(p.tokenAddress);
+            markSeen(p.tokenAddress);
             continue;
           }
         }
@@ -475,7 +550,7 @@ async function scan() {
         const currentPrice = parseFloat(pair?.priceUsd || '0');
 
         if (!liquidity && mcap > 0) liquidity = mcap * 0.15;
-        if (!mcap) { seenTokens.add(p.tokenAddress); continue; }
+        if (!mcap) { markSeen(p.tokenAddress); continue; }
 
         const isNew = p.source === 'pumpfun-new' || p.source === 'dex-new';
         const isReversal = p.source === 'reversal';
@@ -516,7 +591,7 @@ async function scan() {
 
         if (!pattern.passedPatterns) {
           console.log(`⏭ ${ticker} failed: ${pattern.reason}`);
-          seenTokens.add(p.tokenAddress);
+          markSeen(p.tokenAddress);
           continue;
         }
 
@@ -569,7 +644,7 @@ async function scan() {
 
         // ✅ Only set alert record if NOT already tracked — preserve original alertTime
         if (!alertHistory.has(address)) {
-          alertHistory.set(address, {
+          setAlert(address, {
             ticker, address,
             alertTime: Date.now(),
             alertMcap: mcap,
@@ -629,8 +704,7 @@ async function scan() {
         await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
         console.log(`✅ Alert sent: ${ticker} — Score: ${alphaScore}/100 — Source: ${p.source}`);
 
-        seenTokens.add(p.tokenAddress);
-        if (seenTokens.size > 500) seenTokens.clear();
+        markSeen(p.tokenAddress);
 
       } catch (innerErr: any) {
         console.log(`❌ Error on token: ${innerErr.message}`);
@@ -659,9 +733,18 @@ async function init() {
         peak_time BIGINT,
         current_mcap NUMERIC,
         current_price NUMERIC,
-        last_updated BIGINT
+        last_updated BIGINT,
+        exit_reason TEXT,
+        exit_price NUMERIC,
+        exit_mcap NUMERIC,
+        exit_time BIGINT
       );
     `);
+    // ── Finding 1: backfill exit columns on tables created before this fix ──
+    await db.query(`ALTER TABLE alert_history ADD COLUMN IF NOT EXISTS exit_reason TEXT`);
+    await db.query(`ALTER TABLE alert_history ADD COLUMN IF NOT EXISTS exit_price NUMERIC`);
+    await db.query(`ALTER TABLE alert_history ADD COLUMN IF NOT EXISTS exit_mcap NUMERIC`);
+    await db.query(`ALTER TABLE alert_history ADD COLUMN IF NOT EXISTS exit_time BIGINT`);
     console.log('✅ alert_history table ready');
   } catch (e: any) {
     console.log(`⚠️ alert_history table setup failed: ${e.message}`);
@@ -963,7 +1046,7 @@ bot.action(/^refresh_pnl_(.+)$/, async (ctx) => {
         updated.peakMcap = currentMcap;
         updated.peakTime = Date.now();
       }
-      alertHistory.set(address, updated);
+      setAlert(address, updated);
       await saveHistory();
     }
   } catch {}
@@ -1041,10 +1124,20 @@ bot.command('settings', async (ctx) => {
   await ctx.reply(text, { parse_mode: 'Markdown', ...keyboard });
 });
 
+// ── Finding 8: /cancel aborts a pending settings prompt ──
+bot.command('cancel', async (ctx) => {
+  const chatId = ctx.chat.id.toString();
+  if (!awaitingInput.has(chatId)) {
+    return ctx.reply('Nothing to cancel.');
+  }
+  clearAwaiting(chatId);
+  await ctx.reply('❌ Cancelled.');
+});
+
 // ── Callbacks: each button puts the chat into an awaiting state ──
 bot.action('set_wallet_key', async (ctx) => {
   await ctx.answerCbQuery();
-  awaitingInput.set(ctx.chat!.id.toString(), 'privateKey');
+  setAwaiting(ctx.chat!.id.toString(), 'privateKey');
   await ctx.reply(
     `🔑 *Paste your Solana wallet private key* \\(base58\\) in the next message\\.\n\n` +
     `⚠️ Your message will be deleted immediately after processing\\.\n` +
@@ -1055,7 +1148,7 @@ bot.action('set_wallet_key', async (ctx) => {
 
 bot.action('set_trade_size', async (ctx) => {
   await ctx.answerCbQuery();
-  awaitingInput.set(ctx.chat!.id.toString(), 'tradeSize');
+  setAwaiting(ctx.chat!.id.toString(), 'tradeSize');
   await ctx.reply(
     `💰 *Enter trade size in SOL*\n\nExample: \`0.15\` or \`0.5\`\n\nCurrent: *${botSettings.tradeSizeSol} SOL*`,
     { parse_mode: 'Markdown' }
@@ -1064,7 +1157,7 @@ bot.action('set_trade_size', async (ctx) => {
 
 bot.action('set_tp', async (ctx) => {
   await ctx.answerCbQuery();
-  awaitingInput.set(ctx.chat!.id.toString(), 'tp');
+  setAwaiting(ctx.chat!.id.toString(), 'tp');
   await ctx.reply(
     `🎯 *Enter Take Profit percentage*\n\nExample: \`50\` closes the trade at \\+50%\n\nCurrent: *${botSettings.takeProfitPct}%*`,
     { parse_mode: 'Markdown' }
@@ -1073,7 +1166,7 @@ bot.action('set_tp', async (ctx) => {
 
 bot.action('set_sl', async (ctx) => {
   await ctx.answerCbQuery();
-  awaitingInput.set(ctx.chat!.id.toString(), 'sl');
+  setAwaiting(ctx.chat!.id.toString(), 'sl');
   await ctx.reply(
     `🛑 *Enter Stop Loss percentage*\n\nExample: \`35\` closes the trade if it drops \\-35% from entry\n\nCurrent: *${botSettings.stopLossPct}%*`,
     { parse_mode: 'Markdown' }
@@ -1086,7 +1179,7 @@ bot.on('text', async (ctx) => {
   const waiting = awaitingInput.get(chatId);
   if (!waiting) return;
 
-  awaitingInput.delete(chatId);
+  clearAwaiting(chatId);
   const input = ctx.message.text.trim();
 
   if (waiting === 'privateKey') {
