@@ -47,7 +47,7 @@ const DOMAIN = process.env.RAILWAY_STATIC_URL || process.env.RENDER_EXTERNAL_URL
 const seenTokens = new Set<string>();
 const seenTokensQueue: string[] = [];
 const wssPumpTokensQueue: any[] = [];
-type AwaitingType = 'privateKey' | 'tradeSize' | 'tp' | 'sl';
+type AwaitingType = 'privateKey' | 'tradeSize' | 'tp' | 'sl' | 'delayedEntryMcap';
 const awaitingInput = new Map<string, AwaitingType>();
 const awaitingTimers = new Map<string, NodeJS.Timeout>();
 const AWAITING_TIMEOUT_MS = 5 * 60 * 1000;
@@ -100,8 +100,7 @@ interface Position {
 }
 const openPositions = new Map<string, Position>();
 
-// ── Delayed entry: alert fires immediately, auto-buy waits for this mcap ──
-const DELAYED_ENTRY_MCAP_THRESHOLD = 15000;
+// ── Delayed entry: alert fires immediately, auto-buy waits for botSettings.delayedEntryMcap ──
 interface PendingEntry {
   ticker: string;
   address: string;
@@ -378,7 +377,7 @@ async function monitorPositions() {
       const { price: currentPrice, mcap: currentMcap } = await getLivePrice(address);
       if (!currentPrice) return;
 
-      if (pendingEntries.has(address) && currentMcap >= DELAYED_ENTRY_MCAP_THRESHOLD) {
+      if (pendingEntries.has(address) && currentMcap >= botSettings.delayedEntryMcap) {
         const pending = pendingEntries.get(address)!;
         pendingEntries.delete(address);
         if (executor.hasWallet()) {
@@ -656,9 +655,9 @@ async function scan() {
           executionState = `⚙️ No wallet — use /settings to enable auto\\-buy`;
         } else if (risk.allow) {
           // ── Delayed entry: alert now, but hold the auto-buy until mcap reaches the threshold ──
-          if (botSettings.delayedEntryEnabled && mcap < DELAYED_ENTRY_MCAP_THRESHOLD) {
+          if (botSettings.delayedEntryEnabled && mcap < botSettings.delayedEntryMcap) {
             pendingEntries.set(address, { ticker, address });
-            executionState = `⏳ Delayed Entry Armed — waiting for $${DELAYED_ENTRY_MCAP_THRESHOLD.toLocaleString('en-US')} MCAP \\(currently $${mcap.toLocaleString('en-US', { maximumFractionDigits: 0 })}\\)`;
+            executionState = `⏳ Delayed Entry Armed — waiting for $${botSettings.delayedEntryMcap.toLocaleString('en-US')} MCAP \\(currently $${mcap.toLocaleString('en-US', { maximumFractionDigits: 0 })}\\)`;
           } else {
             try {
               const tradeSol = botSettings.tradeSizeSol;
@@ -865,7 +864,7 @@ bot.command('positions', async (ctx) => {
     lines.push('');
   }
   if (pendingEntries.size > 0) {
-    lines.push(`⏳ *Waiting for $${DELAYED_ENTRY_MCAP_THRESHOLD.toLocaleString('en-US')} MCAP:*`, '');
+    lines.push(`⏳ *Waiting for $${botSettings.delayedEntryMcap.toLocaleString('en-US')} MCAP:*`, '');
     for (const pending of pendingEntries.values()) {
       lines.push(`• $${escapeText(pending.ticker)}`);
     }
@@ -1169,7 +1168,7 @@ function buildSettingsMessage() {
     `💰 *Trade Size:* ${botSettings.tradeSizeSol} SOL per trade`,
     `🎯 *Take Profit:* +${botSettings.takeProfitPct}%`,
     `🛑 *Stop Loss:* \\-${botSettings.stopLossPct}%`,
-    `⏳ *Delayed Entry \\($${DELAYED_ENTRY_MCAP_THRESHOLD.toLocaleString('en-US')} MCAP\\):* ${botSettings.delayedEntryEnabled ? '✅ ON' : '❌ OFF'}`,
+    `⏳ *Delayed Entry:* ${botSettings.delayedEntryEnabled ? '✅ ON' : '❌ OFF'} — buy held until $${botSettings.delayedEntryMcap.toLocaleString('en-US')} MCAP`,
   ].join('\n');
 
   const keyboard = Markup.inlineKeyboard([
@@ -1181,6 +1180,7 @@ function buildSettingsMessage() {
       botSettings.delayedEntryEnabled ? '⏳ Delayed Entry: ON (tap to disable)' : '⏳ Delayed Entry: OFF (tap to enable)',
       'toggle_delayed_entry'
     )],
+    [Markup.button.callback('🎯 Set Delayed Entry MCAP', 'set_delayed_entry_mcap')],
   ]);
 
   return { text, keyboard };
@@ -1250,6 +1250,15 @@ bot.action('set_sl', async (ctx) => {
   );
 });
 
+bot.action('set_delayed_entry_mcap', async (ctx) => {
+  await ctx.answerCbQuery();
+  setAwaiting(ctx.chat!.id.toString(), 'delayedEntryMcap');
+  await ctx.reply(
+    `🎯 *Enter the MCAP \\(in USD\\) the auto\\-buy should wait for*\n\nExample: \`15000\`\n\nCurrent: *$${botSettings.delayedEntryMcap.toLocaleString('en-US')}*`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
 // ── Text handler: routes input to the correct setting ──
 bot.on('text', async (ctx) => {
   const chatId = ctx.chat.id.toString();
@@ -1309,6 +1318,14 @@ bot.on('text', async (ctx) => {
     botSettings.stopLossPct = value;
     await saveSetting(chatId, 'stopLossPct', value);
     await ctx.reply(`✅ *Stop loss set to \\-${value}%*`, { parse_mode: 'Markdown' });
+  } else if (waiting === 'delayedEntryMcap') {
+    if (value > 26000) {
+      await ctx.reply(`❌ MCAP capped at $26,000 — the scanner never alerts tokens above that, so a higher wait target would never trigger\\.`, { parse_mode: 'Markdown' });
+      return;
+    }
+    botSettings.delayedEntryMcap = value;
+    await saveSetting(chatId, 'delayedEntryMcap', value);
+    await ctx.reply(`✅ *Delayed entry MCAP set to $${value.toLocaleString('en-US')}*`, { parse_mode: 'Markdown' });
   }
 });
 
