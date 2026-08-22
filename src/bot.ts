@@ -956,14 +956,21 @@ async function scan() {
         // ── FIX 1: Soft skips do NOT add to seenTokens — token stays eligible for re-scan ──
         if (mcap < mcapMin || mcap > 50000) continue;
         
-        // ── Time-alive filter — skip tokens under 45 minutes old (non-WSS only) ──
+        // ── Time-alive filter — skip tokens under 45 minutes old (applies to ALL sources, including WSS/new) ──
         const ageMinutes = pair?.pairCreatedAt ? (Date.now() - pair.pairCreatedAt) / 60000 : 0;
-        if (!isNew && pair?.pairCreatedAt) {
+        if (pair?.pairCreatedAt) {
           if (ageMinutes < 45) {
             console.log(`⏭ ${ticker} too young: ${ageMinutes.toFixed(1)} mins old, skipping`);
             // ── FIX 1: Soft skip — do NOT add to seenTokens ──
             continue;
           }
+        } else if (isNew) {
+          // ── WSS pumpfun-new tokens often have no DexScreener pair yet (too fresh to
+          // have a pair record at all) — pairCreatedAt is undefined, meaning we can't
+          // confirm age, not that it's "old enough". Skip for now; it'll get picked up
+          // again on a later scan once DexScreener has indexed the pair. ──
+          console.log(`⏭ ${ticker} has no pairCreatedAt yet — can't confirm age, skipping for now`);
+          continue;
         }
 
         const rugProb = computeRugProbability(mcap, liquidity);
