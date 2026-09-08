@@ -13,7 +13,15 @@ import { getDemoBalance, ensureDemoAccount, adjustDemoBalance, resetDemoAccount 
 import { recordEntry, recordExit, getClosedTrades } from './trades';
 import { renderPnlChart } from './chart';
 import { evaluateTrailing, multipleToProfitPct } from './trailing';
-import { savePosition, deletePosition, loadPositions, openExposureSol } from './positions';
+import {
+  savePosition,
+  deletePosition,
+  loadPositions,
+  openExposureSol,
+  savePendingEntry,
+  deletePendingEntry,
+  loadPendingEntries,
+} from './positions';
 import { helpText, chunk } from './help';
 import { TokenSignal } from './types';
 import { saveEncryptedWallet, loadDecryptedWallet } from './wallet';
@@ -952,8 +960,11 @@ async function monitorPositions() {
   });
 
   // Drop pending entries whose alert has aged out of the 24h tracking window
-  for (const addr of pendingEntries.keys()) {
-    if (!recentAlerts.includes(addr)) pendingEntries.delete(addr);
+  for (const addr of Array.from(pendingEntries.keys())) {
+    if (!recentAlerts.includes(addr)) {
+      pendingEntries.delete(addr);
+      await deletePendingEntry(botSettings.tradingMode, addr);
+    }
   }
 
   const allAddresses = new Set([...openPositions.keys(), ...recentAlerts, ...pendingEntries.keys()]);
@@ -967,6 +978,7 @@ async function monitorPositions() {
       if (pendingEntries.has(address) && currentMcap >= botSettings.delayedEntryMcap) {
         const pending = pendingEntries.get(address)!;
         pendingEntries.delete(address);
+        await deletePendingEntry(botSettings.tradingMode, address);
         if (executor.hasWallet() || botSettings.tradingMode === 'DEMO') {
           try {
             const tradeSol = botSettings.tradeSizeSol;
@@ -1395,6 +1407,7 @@ async function scan() {
           // ── Delayed entry: alert now, but hold the auto-buy until mcap reaches the threshold ──
           if (botSettings.delayedEntryEnabled && mcap < botSettings.delayedEntryMcap) {
             pendingEntries.set(address, { ticker, address });
+            await savePendingEntry(botSettings.tradingMode, { ticker, address });
             executionState = `⏳ Delayed Entry Armed — waiting for $${botSettings.delayedEntryMcap.toLocaleString('en-US')} MCAP \\(currently $${mcap.toLocaleString('en-US', { maximumFractionDigits: 0 })}\\)`;
           } else {
             try {
@@ -1600,6 +1613,15 @@ async function init() {
       );
     } else {
       console.log('No open positions to restore.');
+    }
+
+    const pending = await loadPendingEntries(botSettings.tradingMode);
+    for (const e of pending) pendingEntries.set(e.address, e);
+    if (pending.length) {
+      console.log(
+        `\u267b\ufe0f Restored ${pending.length} armed delayed entr${pending.length === 1 ? 'y' : 'ies'}: ` +
+          pending.map((e) => e.ticker).join(', ')
+      );
     }
   } catch (e: any) {
     console.log(`⚠️ Position restore failed: ${e.message}`);

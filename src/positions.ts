@@ -84,6 +84,53 @@ export async function loadPositions(mode: TradingMode): Promise<StoredPosition[]
   }
 }
 
+// ── Delayed entries ──────────────────────────────────────────────────────────
+// A token that has alerted and is armed to buy once it reaches the market-cap
+// trigger. These were in-memory only, so a restart silently dropped every
+// armed entry: the bot forgot it was waiting, and the buy would never fire
+// even if the trigger hit moments later.
+//
+// Stored in the same table under status 'PENDING'. No capital is committed
+// yet, so these are deliberately excluded from the exposure total and from
+// the open-position restore.
+
+export interface PendingEntryRecord {
+  ticker: string;
+  address: string;
+}
+
+export async function savePendingEntry(mode: TradingMode, e: PendingEntryRecord): Promise<void> {
+  try {
+    await prisma.activePosition.upsert({
+      where: { tokenAddress_mode: { tokenAddress: e.address, mode } },
+      create: { tokenAddress: e.address, mode, ticker: e.ticker, status: 'PENDING', sizeSol: 0 },
+      update: { ticker: e.ticker, status: 'PENDING' },
+    });
+  } catch (err: any) {
+    console.log(`Pending entry save failed for ${e.ticker}: ${err.message}`);
+  }
+}
+
+export async function deletePendingEntry(mode: TradingMode, address: string): Promise<void> {
+  try {
+    await prisma.activePosition.deleteMany({
+      where: { tokenAddress: address, mode, status: 'PENDING' },
+    });
+  } catch (err: any) {
+    console.log(`Pending entry delete failed for ${address}: ${err.message}`);
+  }
+}
+
+export async function loadPendingEntries(mode: TradingMode): Promise<PendingEntryRecord[]> {
+  try {
+    const rows = await prisma.activePosition.findMany({ where: { mode, status: 'PENDING' } });
+    return rows.map((r) => ({ ticker: r.ticker || '?', address: r.tokenAddress }));
+  } catch (err: any) {
+    console.log(`Pending entry load failed: ${err.message}`);
+    return [];
+  }
+}
+
 /** Total SOL deployed across open positions in this mode — used for the cap. */
 export async function openExposureSol(mode: TradingMode): Promise<number> {
   try {
