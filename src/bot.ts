@@ -6,11 +6,13 @@ import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey } from '@solana/web3.j
 import bs58 from 'bs58';
 import { OnChainPatternRecognition } from './intelligence';
 import { CapitalRiskEngine } from './risk';
+import * as http from 'http';
 import { LowLatencyExecutionEngine } from './execution';
 import { TradeGateway, TradeResult } from './trading';
 import { getDemoBalance, ensureDemoAccount, adjustDemoBalance, resetDemoAccount } from './demo';
 import { recordEntry, recordExit, getClosedTrades } from './trades';
 import { renderPnlChart } from './chart';
+import { helpIndex, helpTopic, chunk, TOPICS } from './help';
 import { TokenSignal } from './types';
 import { saveEncryptedWallet, loadDecryptedWallet } from './wallet';
 import { saveSetting, loadSettings, BotSettings, DEFAULT_SETTINGS } from './settings';
@@ -125,10 +127,24 @@ const DOMAIN =
   process.env.RENDER_EXTERNAL_URL ||
   '';
 
-if (!DOMAIN) {
+// Transport: webhook or long polling.
+//
+// Polling needs no public URL at all — the bot opens an outbound connection to
+// Telegram and pulls updates, so it works behind NAT, on a laptop, with no
+// tunnel and no TLS. It is the right default for local development.
+//
+// Webhook is lower latency and cheaper at scale, and is what you want on a VPS
+// with a real domain. Auto-selected when a public URL is present; override
+// either way with BOT_MODE=polling|webhook.
+const BOT_MODE: 'polling' | 'webhook' =
+  process.env.BOT_MODE === 'polling' ? 'polling'
+  : process.env.BOT_MODE === 'webhook' ? 'webhook'
+  : DOMAIN ? 'webhook' : 'polling';
+
+if (BOT_MODE === 'webhook' && !DOMAIN) {
   console.error(
-    'FATAL: no public URL set. Set PUBLIC_URL to this service public HTTPS origin ' +
-    '(e.g. https://bot.yourdomain.com) so Telegram can deliver webhook updates.'
+    'FATAL: BOT_MODE=webhook but no public URL set. Either set PUBLIC_URL to a ' +
+    'public HTTPS origin, or use BOT_MODE=polling which needs no URL at all.'
   );
   process.exit(1);
 }
@@ -1403,40 +1419,82 @@ async function init() {
   await loadHistory();
 }
 
-bot.launch({
-  webhook: { domain: DOMAIN, port: PORT }
-}).then(async () => {
-  console.log(`🤖 Bot Live via Webhook on port ${PORT}`);
+// In polling mode Telegraf starts no HTTP server, but the container
+// healthcheck (and Coolify) still expect the port to answer. This tiny server
+// fills that gap; in webhook mode Telegraf owns the port instead.
+function startHealthServer() {
+  http
+    .createServer((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end('ok');
+    })
+    .listen(PORT, () => console.log(`🩺 Health server listening on ${PORT}`));
+}
+
+/**
+ * Startup.
+ *
+ * The bookkeeping runs BEFORE the transport starts, for two reasons. It means
+ * the bot never accepts an update while settings, wallet and history are still
+ * loading — and, critically, Telegraf's launch() in POLLING mode does not
+ * resolve until the bot stops. The old `bot.launch(...).then(startup)` shape
+ * silently never ran any of this once polling was an option.
+ */
+async function startBot(): Promise<void> {
   await init();
+
   startPumpPortalStream();
   // Robinhood Chain temporarily disabled — re-enable by uncommenting the import
   // at the top of this file and restoring this block.
   // if (botSettings.robinhoodEnabled) {
   // startPonsFactoryListener();
   // }
+
   scan();
   setInterval(scan, 60000);
   // Slow loop: alert tracking, milestone cards, delayed entries.
   setInterval(monitorPositions, MONITOR_LOOP_MS);
-  // Fast loop: open-position TP/SL only. This is the single biggest latency
-  // win -- stop-loss detection drops from a worst case of ~30s to ~1s.
+  // Fast loop: open-position TP/SL only. The single biggest latency win —
+  // stop-loss detection drops from a worst case of ~30s to ~1s.
   setInterval(monitorRisk, RISK_LOOP_MS);
-  console.log(`Risk loop ${RISK_LOOP_MS}ms | monitor loop ${MONITOR_LOOP_MS}ms | mode ${botSettings.tradingMode}`);
-  // ── Calendar-aligned: 12h digest fires at 00:00 & 12:00 UTC, daily recap at
-  // midnight UTC, weekly digest Sunday midnight UTC — not rolling from restart time ──
+
+  // Calendar-aligned: 12h digest at 00:00 & 12:00 UTC, daily recap at midnight
+  // UTC, weekly on Sunday — not rolling from restart time.
   scheduleTwiceDaily(() => postTopGainers(12 * 60 * 60 * 1000, 'Last 12 Hours'));
   scheduleWeekly(() => postRecap(7 * 24 * 60 * 60 * 1000, 'Weekly Recap'), 0, 0);
   scheduleDaily(() => postRecap(24 * 60 * 60 * 1000, 'Daily Recap'), 0);
   scheduleMonthly(() => postRecap(30 * 24 * 60 * 60 * 1000, 'Monthly Recap'), 0);
-  setInterval(async () => {
-    try {
-      await axios.get(DOMAIN, { timeout: 5000 });
-      console.log('🏓 Self-ping sent — bot is alive');
-    } catch {}
-  }, 5 * 60 * 1000);
 
-}).catch((err) => {
-  console.error("Fatal Launch Error:", err);
+  if (BOT_MODE === 'webhook') {
+    await bot.launch({ webhook: { domain: DOMAIN, port: PORT } });
+    console.log(`🤖 Bot live via webhook on ${DOMAIN} (port ${PORT})`);
+
+    // Keep-alive ping for free tiers that sleep idle services. Pointless
+    // without a public URL, so it is webhook-only.
+    setInterval(async () => {
+      try {
+        await axios.get(DOMAIN, { timeout: 5000 });
+      } catch {}
+    }, 5 * 60 * 1000);
+  } else {
+    startHealthServer();
+    // Long polling opens an outbound connection to Telegram, so it needs no
+    // public URL, no TLS and no tunnel. launch() here only settles once the
+    // bot stops, so it must NOT be awaited.
+    bot.launch({ dropPendingUpdates: true }).catch((err) => {
+      console.error('Polling stopped:', err);
+      process.exit(1);
+    });
+    console.log('🤖 Bot live via long polling — no public URL needed');
+  }
+
+  console.log(
+    `Risk loop ${RISK_LOOP_MS}ms | monitor loop ${MONITOR_LOOP_MS}ms | trading mode ${botSettings.tradingMode}`
+  );
+}
+
+startBot().catch((err) => {
+  console.error('Fatal launch error:', err);
   process.exit(1);
 });
 
@@ -1526,6 +1584,40 @@ Open: ${open}   Closed: ${closed}
   }
 
   return ctx.reply('Usage: /demo [status | add <sol> | sub <sol> | reset [balance]]');
+});
+
+// ── Help ──────────────────────────────────────────────────────────────────────
+// Sent as plain text on purpose: setting names and env vars are full of
+// underscores, and Telegram's Markdown parser reads those as italics markers —
+// one unbalanced underscore fails the whole send with a 400.
+bot.command('help', async (ctx) => {
+  const parts = ((ctx.message as any)?.text || '').trim().split(/ +/);
+  const topic = (parts[1] || '').toLowerCase();
+
+  if (!topic) {
+    return ctx.reply(helpIndex(botSettings));
+  }
+
+  if (topic === 'all') {
+    for (const t of TOPICS) {
+      const body = helpTopic(t, botSettings);
+      if (!body) continue;
+      for (const part of chunk(body)) {
+        await ctx.reply(part);
+      }
+    }
+    return;
+  }
+
+  const body = helpTopic(topic, botSettings);
+  if (!body) {
+    return ctx.reply(
+      'Unknown help topic: ' + topic + '\n\nTry one of: ' + TOPICS.join(', ') + ', all'
+    );
+  }
+  for (const part of chunk(body)) {
+    await ctx.reply(part);
+  }
 });
 
 // ── P&L chart ─────────────────────────────────────────────────────────────────

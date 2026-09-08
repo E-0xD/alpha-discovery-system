@@ -12,12 +12,19 @@ npm run dev       # compile and start
 `WALLET_ENCRYPTION_KEY` only when blank and never replaces an existing one,
 because that key decrypts the wallet stored in the database.
 
-Telegram only delivers webhooks over public HTTPS, so local runs need a tunnel
-started **before** the bot:
+**No public URL needed.** With `PUBLIC_URL` blank the bot uses long polling —
+it connects out to Telegram and pulls updates, so it works behind NAT with no
+tunnel and no TLS. This is the default for local development.
+
+If you do want webhook mode locally, start a tunnel **before** the bot and set
+`PUBLIC_URL` to it:
 
 ```bash
 ngrok http 10000 --domain=<your-reserved-domain>
 ```
+
+Force either transport with `BOT_MODE=polling` or `BOT_MODE=webhook`; left
+blank it picks webhook when `PUBLIC_URL` is set and polling when it isn't.
 
 ---
 
