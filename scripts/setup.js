@@ -160,6 +160,18 @@ const rpc = (process.env.QUICKNODE_RPC_URL || process.env.SOLANA_RPC_URL || '').
 if (rpc) ok('RPC configured');
 else warn('no RPC — falls back to the public endpoint, which is heavily rate limited');
 
+if ((process.env.HELIUS_API_KEY || '').trim()) ok('Helius configured');
+else warn('no HELIUS_API_KEY — on-chain holder/deployer analysis degraded');
+
+// Easy to miss because it fails silently: no key means scoreLoreWithAI()
+// always returns 0, the +15 alpha boost never fires, and tokens scoring
+// 55-69 with strong narratives are skipped with no error and no log line.
+if ((process.env.GROQ_API_KEY || '').trim()) ok('Groq configured — lore scoring active');
+else warn('no GROQ_API_KEY — the +15 lore boost never fires (silently). Free at console.groq.com');
+
+if ((process.env.QUICKNODE_JUPITER_URL || '').trim()) ok('Jupiter add-on configured');
+else info('no Jupiter add-on — using the public rate-limited endpoint');
+
 if ((process.env.REDIS_URL || '').trim()) ok('Redis configured');
 else info('no Redis — running on SQLite alone (correct for one container)');
 
