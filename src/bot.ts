@@ -12,7 +12,7 @@ import { TradeGateway, TradeResult } from './trading';
 import { getDemoBalance, ensureDemoAccount, adjustDemoBalance, resetDemoAccount } from './demo';
 import { recordEntry, recordExit, getClosedTrades } from './trades';
 import { renderPnlChart } from './chart';
-import { helpIndex, helpTopic, chunk, TOPICS } from './help';
+import { helpText, chunk } from './help';
 import { TokenSignal } from './types';
 import { saveEncryptedWallet, loadDecryptedWallet } from './wallet';
 import { saveSetting, loadSettings, BotSettings, DEFAULT_SETTINGS } from './settings';
@@ -1591,31 +1591,7 @@ Open: ${open}   Closed: ${closed}
 // underscores, and Telegram's Markdown parser reads those as italics markers —
 // one unbalanced underscore fails the whole send with a 400.
 bot.command('help', async (ctx) => {
-  const parts = ((ctx.message as any)?.text || '').trim().split(/ +/);
-  const topic = (parts[1] || '').toLowerCase();
-
-  if (!topic) {
-    return ctx.reply(helpIndex(botSettings));
-  }
-
-  if (topic === 'all') {
-    for (const t of TOPICS) {
-      const body = helpTopic(t, botSettings);
-      if (!body) continue;
-      for (const part of chunk(body)) {
-        await ctx.reply(part);
-      }
-    }
-    return;
-  }
-
-  const body = helpTopic(topic, botSettings);
-  if (!body) {
-    return ctx.reply(
-      'Unknown help topic: ' + topic + '\n\nTry one of: ' + TOPICS.join(', ') + ', all'
-    );
-  }
-  for (const part of chunk(body)) {
+  for (const part of chunk(helpText(botSettings))) {
     await ctx.reply(part);
   }
 });
