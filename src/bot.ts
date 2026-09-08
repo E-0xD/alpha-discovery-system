@@ -9,6 +9,8 @@ import { CapitalRiskEngine } from './risk';
 import { LowLatencyExecutionEngine } from './execution';
 import { TradeGateway, TradeResult } from './trading';
 import { getDemoBalance, ensureDemoAccount, adjustDemoBalance, resetDemoAccount } from './demo';
+import { recordEntry, recordExit, getClosedTrades } from './trades';
+import { renderPnlChart } from './chart';
 import { TokenSignal } from './types';
 import { saveEncryptedWallet, loadDecryptedWallet } from './wallet';
 import { saveSetting, loadSettings, BotSettings, DEFAULT_SETTINGS } from './settings';
@@ -599,6 +601,17 @@ async function evaluateOpenPosition(
             });
             await saveHistory();
           }
+          // Record the closed trade for this mode so the P&L chart has real fills.
+          await recordExit({
+            address,
+            mode: botSettings.tradingMode,
+            exitPrice: sellResult.fillPrice ?? currentPrice,
+            exitType: 'TP',
+            pnlPct,
+            pnlSol,
+            heldMinutes: holdingMins,
+            peakPrice: pos.peakPrice,
+          });
           openPositions.delete(address);
           console.log(`✅ TP hit + sold: ${pos.ticker} +${pnlPct.toFixed(1)}% — tx: ${sellResult.signature}`);
           return;
@@ -648,6 +661,17 @@ async function evaluateOpenPosition(
             });
             await saveHistory();
           }
+          // Record the closed trade for this mode so the P&L chart has real fills.
+          await recordExit({
+            address,
+            mode: botSettings.tradingMode,
+            exitPrice: sellResult.fillPrice ?? currentPrice,
+            exitType: 'SL',
+            pnlPct,
+            pnlSol,
+            heldMinutes: holdingMins,
+            peakPrice: pos.peakPrice,
+          });
           openPositions.delete(address);
 
           // ── Only announce stop-loss for tokens that never gained real traction.
@@ -775,6 +799,13 @@ async function monitorPositions() {
                 stopLossLevel: 'initial',
                 stopLossPct: -35,
                 remainingPct: 100,
+              });
+              await recordEntry({
+                address,
+                ticker: pending.ticker,
+                mode: botSettings.tradingMode,
+                entryPrice: result.fillPrice ?? currentPrice,
+                sizeSol: tradeSol,
               });
               const txLink = result.signature ? ` — [Solscan](https://solscan.io/tx/${result.signature})` : '';
               await bot.telegram.sendMessage(CHAT_ID, [
@@ -1203,6 +1234,13 @@ async function scan() {
                     stopLossPct: -35,
                     remainingPct: 100,
                   });
+                  await recordEntry({
+                    address,
+                    ticker: ticker,
+                    mode: botSettings.tradingMode,
+                    entryPrice: result.fillPrice ?? currentPrice,
+                    sizeSol: tradeSol,
+                  });
                   console.log(`📌 Position opened: ${ticker} @ $${executedPrice}`);
                 }
               } else {
@@ -1450,6 +1488,48 @@ Open: ${open}   Closed: ${closed}
   }
 
   return ctx.reply('Usage: /demo [status | add <sol> | sub <sol> | reset [balance]]');
+});
+
+// ── P&L chart ─────────────────────────────────────────────────────────────────
+// Always follows the CURRENT trading mode: in demo you get the demo curve, in
+// live the live one. The two never mix, because trades_log rows are tagged by
+// mode at write time.
+bot.command('chart', async (ctx) => {
+  const parts = ((ctx.message as any)?.text || '').trim().split(/ +/);
+  const arg = (parts[1] || '').toLowerCase();
+
+  const DAY = 24 * 60 * 60 * 1000;
+  const periods: Record<string, [number | undefined, string]> = {
+    day: [DAY, 'Last 24 hours'],
+    week: [7 * DAY, 'Last 7 days'],
+    month: [30 * DAY, 'Last 30 days'],
+    all: [undefined, 'All time'],
+  };
+  const [windowMs, label] = periods[arg] || periods.all;
+  const since = windowMs ? Date.now() - windowMs : undefined;
+
+  const mode = botSettings.tradingMode;
+
+  try {
+    const trades = await getClosedTrades(mode, since);
+    const balanceSol = mode === 'DEMO' ? (await getDemoBalance(CHAT_ID)).balanceSol : undefined;
+
+    const png = await renderPnlChart({ mode, trades, balanceSol, periodLabel: label });
+    const total = trades.reduce((a, t) => a + t.pnlSol, 0);
+    const arrow = total >= 0 ? '📈' : '📉';
+
+    await ctx.replyWithPhoto(
+      { source: png },
+      {
+        caption:
+          arrow + ' ' + mode + ' P&L — ' + label + '  ·  ' + trades.length + ' closed trade(s)' +
+          '\n\n/chart day | week | month | all',
+      }
+    );
+  } catch (e: any) {
+    console.log(`Chart render failed: ${e.message}`);
+    await ctx.reply(`⚠️ Could not render the chart: ${e.message}`);
+  }
 });
 
 bot.command('positions', async (ctx) => {
