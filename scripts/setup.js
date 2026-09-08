@@ -175,6 +175,44 @@ else info('no Jupiter add-on — using the public rate-limited endpoint');
 if ((process.env.REDIS_URL || '').trim()) ok('Redis configured');
 else info('no Redis — running on SQLite alone (correct for one container)');
 
+// ── Drift guard ──────────────────────────────────────────────────────────────
+// GROQ_API_KEY was read by the code but absent from .env.example, so there was
+// no way to discover it existed — it degraded scoring silently for who knows
+// how long. This check makes that class of gap impossible to reintroduce.
+function scanEnvUsage(dir, found) {
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (['node_modules', 'dist', '.git', 'data'].includes(e.name)) continue;
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) scanEnvUsage(p, found);
+    else if (/\.(ts|js)$/.test(e.name)) {
+      const s = fs.readFileSync(p, 'utf8');
+      for (const m of s.matchAll(/process\.env\.([A-Z0-9_]+)/g)) found.add(m[1]);
+      for (const m of s.matchAll(/process\.env\[['"]([A-Z0-9_]+)['"]\]/g)) found.add(m[1]);
+    }
+  }
+  return found;
+}
+
+try {
+  const used = scanEnvUsage(ROOT, new Set());
+  const documented = new Set();
+  for (const line of fs.readFileSync(EXAMPLE_PATH, 'utf8').split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t || t.startsWith('#')) continue;
+    const i = t.indexOf('=');
+    if (i > 0) documented.add(t.slice(0, i).trim());
+  }
+  const undocumented = [...used].filter((k) => !documented.has(k)).sort();
+  if (undocumented.length) {
+    console.log('');
+    warn('read by the code but missing from .env.example:');
+    undocumented.forEach((k) => warn('  ' + k));
+    warn('add them there so they are discoverable');
+  }
+} catch {
+  // Never let the guard itself break setup.
+}
+
 // ── Result ───────────────────────────────────────────────────────────────────
 console.log('');
 if (missing > 0) {
