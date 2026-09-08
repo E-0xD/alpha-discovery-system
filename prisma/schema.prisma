@@ -1,0 +1,187 @@
+// SQLite + Prisma. Replaces the previous raw-SQL/Postgres layer.
+//
+// Type notes specific to SQLite:
+//   * Postgres NUMERIC -> Float. SQLite has no decimal type; these are all
+//     prices/percentages where float precision is fine.
+//   * Postgres BIGINT epoch-ms -> Float, deliberately NOT Prisma BigInt.
+//     Prisma BigInt surfaces as a JS `bigint`, which cannot be mixed with
+//     `number` in arithmetic (`now - alertTime` would throw) and breaks
+//     JSON.stringify. Epoch-ms maxes around 1.7e12, far under Number's
+//     2^53 safe-integer ceiling, so Float is lossless here and keeps every
+//     existing `number`-typed call site working untouched.
+//   * JSONB -> String holding serialised JSON; Prisma's Json type is not
+//     supported on SQLite.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+/// Trading mode. Every position/trade row is tagged so live and demo
+/// history stay completely separate and can be charted independently.
+/// SQLite has no native enum, so this is a checked string in app code.
+model Account {
+  username            String   @id
+  priorityTier        String   @default("LOW") @map("priority_tier")
+  reputationScore     Float    @default(50.0) @map("reputation_score")
+  totalSignalsTracked Int      @default(0) @map("total_signals_tracked")
+  lastScanned         DateTime @default(now()) @map("last_scanned")
+
+  @@map("accounts")
+}
+
+model TokenIntelligence {
+  tokenAddress       String   @id @map("token_address")
+  ticker             String?
+  alphaScore         Float    @default(0.0) @map("alpha_score")
+  rugProbability     Float    @default(0.0) @map("rug_probability")
+  insiderRiskScore   Float    @default(0.0) @map("insider_risk_score")
+  narrativeStrength  Float    @default(0.0) @map("narrative_strength")
+  classification     String   @default("ORGANIC")
+  alertSent          Boolean  @default(false) @map("alert_sent")
+  isBundledLaunch    Boolean  @default(false) @map("is_bundled_launch")
+  devRugHistoryCount Int      @default(0) @map("dev_rug_history_count")
+  lastUpdated        DateTime @default(now()) @map("last_updated")
+
+  @@map("token_intelligence")
+}
+
+model ActivePosition {
+  tokenAddress    String  @map("token_address")
+  mode            String  @default("LIVE")
+  ticker          String?
+  entryPriceUsd   Float?  @map("entry_price_usd")
+  currentPriceUsd Float?  @map("current_price_usd")
+  sizeSol         Float?  @map("size_sol")
+  tokensHeld      String? @map("tokens_held")
+  status          String  @default("OPEN")
+  highestPriceUsd Float?  @map("highest_price_usd")
+  timestamp       Float?
+
+  // Composite key: the same token can be held simultaneously in live and
+  // demo without the two clobbering each other.
+  @@id([tokenAddress, mode])
+  @@index([mode, status])
+  @@map("active_positions")
+}
+
+model TradeLog {
+  id              Int      @id @default(autoincrement())
+  address         String
+  mode            String   @default("LIVE")
+  ticker          String?
+  source          String?
+  alertTime       Float?   @map("alert_time")
+  alertPrice      Float?   @map("alert_price")
+  alertMcap       Float?   @map("alert_mcap")
+  entryPrice      Float?   @map("entry_price")
+  entrySizeSol    Float?   @map("entry_size_sol")
+  peakPrice       Float?   @map("peak_price")
+  peakMcap        Float?   @map("peak_mcap")
+  peakTime        Float?   @map("peak_time")
+  peakGainPct     Float?   @map("peak_gain_pct")
+  exitPrice       Float?   @map("exit_price")
+  exitTime        Float?   @map("exit_time")
+  exitType        String?  @map("exit_type")
+  pnlPct          Float?   @map("pnl_pct")
+  pnlSol          Float?   @map("pnl_sol")
+  heldMinutes     Int?     @map("held_minutes")
+  alphaScore      Float?   @map("alpha_score")
+  rugProbability  Float?   @map("rug_probability")
+  uniqueBuyers    Int?     @map("unique_buyers")
+  buyerVelocity   String?  @map("buyer_velocity")
+  topHolderPct    Float?   @map("top_holder_pct")
+  isBundledLaunch Boolean? @map("is_bundled_launch")
+  washTrading     Boolean? @map("wash_trading")
+  smartMoney      Boolean? @map("smart_money")
+  status          String   @default("ALERTED")
+
+  // The chart queries closed trades by mode ordered by exit time.
+  @@index([mode, exitTime])
+  @@index([mode, status])
+  @@map("trades_log")
+}
+
+model AlertHistory {
+  address       String  @id
+  ticker        String?
+  alertTime     Float?  @map("alert_time")
+  alertMcap     Float?  @map("alert_mcap")
+  alertPrice    Float?  @map("alert_price")
+  peakMcap      Float?  @map("peak_mcap")
+  peakPrice     Float?  @map("peak_price")
+  peakTime      Float?  @map("peak_time")
+  currentMcap   Float?  @map("current_mcap")
+  currentPrice  Float?  @map("current_price")
+  lastUpdated   Float?  @map("last_updated")
+  exitReason    String? @map("exit_reason")
+  exitPrice     Float?  @map("exit_price")
+  exitMcap      Float?  @map("exit_mcap")
+  exitTime      Float?  @map("exit_time")
+  /// JSON-encoded number[] — SQLite/Prisma has no Json type.
+  milestonesHit String  @default("[]") @map("milestones_hit")
+
+  @@index([alertTime])
+  @@map("alert_history")
+}
+
+model WalletSetting {
+  chatId       String   @id @map("chat_id")
+  encryptedKey String   @map("encrypted_key")
+  iv           String
+  tag          String
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  @@map("wallet_settings")
+}
+
+model BotSetting {
+  chatId              String   @id @map("chat_id")
+  tradeSizeSol        Float    @default(0.15) @map("trade_size_sol")
+  takeProfitPct       Float    @default(50) @map("take_profit_pct")
+  stopLossPct         Float    @default(35) @map("stop_loss_pct")
+  delayedEntryEnabled Boolean  @default(false) @map("delayed_entry_enabled")
+  delayedEntryMcap    Float    @default(15000) @map("delayed_entry_mcap")
+  robinhoodEnabled    Boolean  @default(true) @map("robinhood_enabled")
+  slippageBps         Float    @default(1000) @map("slippage_bps")
+  /// "LIVE" or "DEMO". Demo runs the identical code path but simulates the
+  /// fill instead of signing and broadcasting a real swap.
+  tradingMode         String   @default("LIVE") @map("trading_mode")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  @@map("bot_settings")
+}
+
+/// Simulated wallet for demo mode. Balance is debited/credited by simulated
+/// fills exactly as a real wallet would be, and can be topped up or drawn
+/// down manually via the /demo commands.
+model DemoAccount {
+  chatId          String   @id @map("chat_id")
+  balanceSol      Float    @default(10.0) @map("balance_sol")
+  startingBalance Float    @default(10.0) @map("starting_balance")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  @@map("demo_account")
+}
+
+/// Audit trail of every demo balance movement — simulated fills and manual
+/// adjustments alike — so the demo equity curve can be rebuilt from scratch.
+model DemoLedger {
+  id        Int    @id @default(autoincrement())
+  chatId    String @map("chat_id")
+  /// FILL_BUY | FILL_SELL | MANUAL_ADD | MANUAL_SUB | RESET
+  kind      String
+  amountSol Float  @map("amount_sol")
+  balanceAfter Float @map("balance_after")
+  address   String?
+  ticker    String?
+  note      String?
+  timestamp Float
+
+  @@index([chatId, timestamp])
+  @@map("demo_ledger")
+}

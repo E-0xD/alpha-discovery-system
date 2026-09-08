@@ -1,5 +1,5 @@
 import * as crypto from 'crypto';
-import { db } from './db';
+import { prisma } from './db';
 
 // Derives a 32-byte AES key: prefer explicit env var, fall back to bot token hash.
 // The bot token is already a strong secret, making this safe for single-user self-hosted bots.
@@ -33,27 +33,18 @@ export function decryptPrivateKey(encrypted: string, iv: string, tag: string): s
 
 export async function saveEncryptedWallet(chatId: string, privateKey: string): Promise<void> {
   const { encrypted, iv, tag } = encryptPrivateKey(privateKey);
-  await db.query(
-    `INSERT INTO wallet_settings (chat_id, encrypted_key, iv, tag)
-     VALUES ($1, $2, $3, $4)
-     ON CONFLICT (chat_id) DO UPDATE SET
-       encrypted_key = EXCLUDED.encrypted_key,
-       iv = EXCLUDED.iv,
-       tag = EXCLUDED.tag,
-       updated_at = NOW()`,
-    [chatId, encrypted, iv, tag]
-  );
+  await prisma.walletSetting.upsert({
+    where: { chatId },
+    create: { chatId, encryptedKey: encrypted, iv, tag },
+    update: { encryptedKey: encrypted, iv, tag },
+  });
 }
 
 export async function loadDecryptedWallet(chatId: string): Promise<string | null> {
   try {
-    const res = await db.query(
-      'SELECT encrypted_key, iv, tag FROM wallet_settings WHERE chat_id = $1',
-      [chatId]
-    );
-    if (!res.rows.length) return null;
-    const { encrypted_key, iv, tag } = res.rows[0];
-    return decryptPrivateKey(encrypted_key, iv, tag);
+    const row = await prisma.walletSetting.findUnique({ where: { chatId } });
+    if (!row) return null;
+    return decryptPrivateKey(row.encryptedKey, row.iv, row.tag);
   } catch {
     return null;
   }

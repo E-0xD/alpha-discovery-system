@@ -1,122 +1,85 @@
-import { Pool } from 'pg';
+import { PrismaClient } from '@prisma/client';
 import * as dotenv from 'dotenv';
 
 dotenv.config();
 
-export const db = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+// ── SQLite location ───────────────────────────────────────────────────────────
+// Default is a file under ./data so a bare `npm start` works with no config.
+// In Docker/Coolify this is overridden to a path on a mounted volume
+// (file:/data/bot.db) — see DEPLOY.md. Getting that wrong is the one mistake
+// that silently loses every trade on redeploy, so the resolved path is logged
+// at startup.
+if (!process.env.DATABASE_URL) {
+  process.env.DATABASE_URL = 'file:./data/bot.db?connection_limit=1';
+}
+
+export const prisma = new PrismaClient({
+  log: process.env.PRISMA_DEBUG === 'true' ? ['query', 'warn', 'error'] : ['warn', 'error'],
 });
 
-export async function initDatabaseSchema() {
+/**
+ * SQLite defaults are wrong for this workload. The bot writes from several
+ * timers at once (risk loop, scanner, digests), and stock SQLite serialises
+ * readers against a writer and fails instantly on contention.
+ *
+ *   journal_mode=WAL  — readers no longer block on the writer, which matters
+ *                       because the risk loop must never stall behind a slow
+ *                       digest write.
+ *   busy_timeout      — wait for a held lock instead of throwing SQLITE_BUSY.
+ *   synchronous=NORMAL— fsync per checkpoint rather than per commit. Safe under
+ *                       WAL (survives process crash; a host power-cut could lose
+ *                       the last commits, an acceptable trade for a bot that
+ *                       reconciles open positions from chain state on restart).
+ */
+async function applyPragmas(): Promise<void> {
+  // $queryRawUnsafe, NOT $executeRawUnsafe: several PRAGMA assignments echo
+  // the new value back as a result row, and Prisma's execute path rejects any
+  // statement that returns rows on SQLite ("Execute returned results, which is
+  // not allowed in SQLite"). queryRaw tolerates both rows and no rows.
+  await prisma.$queryRawUnsafe('PRAGMA journal_mode = WAL;');
+  await prisma.$queryRawUnsafe('PRAGMA busy_timeout = 5000;');
+  await prisma.$queryRawUnsafe('PRAGMA synchronous = NORMAL;');
+  await prisma.$queryRawUnsafe('PRAGMA foreign_keys = ON;');
+}
+
+/**
+ * Replaces the old raw-SQL CREATE TABLE bootstrap. The schema itself is now
+ * owned by Prisma migrations (`prisma migrate deploy`, run on container start);
+ * this only applies connection pragmas and seeds the demo wallet.
+ */
+export async function initDatabaseSchema(): Promise<void> {
   try {
-    // Accounts Table
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS accounts (
-        username TEXT PRIMARY KEY,
-        priority_tier TEXT DEFAULT 'LOW',
-        reputation_score NUMERIC DEFAULT 50.0,
-        total_signals_tracked INT DEFAULT 0,
-        last_scanned TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
+    await applyPragmas();
 
-    // Complete On-Chain Token Tracking Schema
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS token_intelligence (
-        token_address TEXT PRIMARY KEY,
-        ticker TEXT,
-        alpha_score NUMERIC DEFAULT 0.0,
-        rug_probability NUMERIC DEFAULT 0.0,
-        insider_risk_score NUMERIC DEFAULT 0.0,
-        narrative_strength NUMERIC DEFAULT 0.0,
-        classification TEXT DEFAULT 'ORGANIC',
-        alert_sent BOOLEAN DEFAULT FALSE,
-        is_bundled_launch BOOLEAN DEFAULT FALSE,
-        dev_rug_history_count INT DEFAULT 0,
-        last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-
-    // Positions Storage for Fault Tolerance
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS active_positions (
-        token_address TEXT PRIMARY KEY,
-        ticker TEXT,
-        entry_price_usd NUMERIC,
-        current_price_usd NUMERIC,
-        size_sol NUMERIC,
-        tokens_held TEXT,
-        status TEXT DEFAULT 'OPEN',
-        highest_price_usd NUMERIC,
-        timestamp BIGINT
-      );
-    `);
-
-    // ── Trades Log — full trade lifecycle tracking ──
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS trades_log (
-        id SERIAL PRIMARY KEY,
-        address TEXT NOT NULL,
-        ticker TEXT,
-        source TEXT,
-        alert_time BIGINT,
-        alert_price NUMERIC,
-        alert_mcap NUMERIC,
-        entry_price NUMERIC,
-        entry_size_sol NUMERIC,
-        peak_price NUMERIC,
-        peak_mcap NUMERIC,
-        peak_time BIGINT,
-        peak_gain_pct NUMERIC,
-        exit_price NUMERIC,
-        exit_time BIGINT,
-        exit_type TEXT,
-        pnl_pct NUMERIC,
-        pnl_sol NUMERIC,
-        held_minutes INTEGER,
-        alpha_score NUMERIC,
-        rug_probability NUMERIC,
-        unique_buyers INTEGER,
-        buyer_velocity TEXT,
-        top_holder_pct NUMERIC,
-        is_bundled_launch BOOLEAN,
-        wash_trading BOOLEAN,
-        smart_money BOOLEAN,
-        status TEXT DEFAULT 'ALERTED'
-      );
-    `);
-
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS wallet_settings (
-        chat_id TEXT PRIMARY KEY,
-        encrypted_key TEXT NOT NULL,
-        iv TEXT NOT NULL,
-        tag TEXT NOT NULL,
-        updated_at TIMESTAMPTZ DEFAULT NOW()
-      );
-    `);
-
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS bot_settings (
-        chat_id TEXT PRIMARY KEY,
-        trade_size_sol NUMERIC DEFAULT 0.15,
-        take_profit_pct NUMERIC DEFAULT 50,
-        stop_loss_pct NUMERIC DEFAULT 35,
-        delayed_entry_enabled BOOLEAN DEFAULT FALSE,
-        delayed_entry_mcap NUMERIC DEFAULT 15000,
-        robinhood_enabled BOOLEAN DEFAULT TRUE,
-        slippage_bps NUMERIC DEFAULT 1000,
-        updated_at TIMESTAMPTZ DEFAULT NOW()
-      );
-    `);
-    await db.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS delayed_entry_enabled BOOLEAN DEFAULT FALSE`);
-    await db.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS delayed_entry_mcap NUMERIC DEFAULT 15000`);
-    await db.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS robinhood_enabled BOOLEAN DEFAULT TRUE`);
-    await db.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS slippage_bps NUMERIC DEFAULT 1000`);
-
-    console.log("⚡ Supabase Tables & High-Performance Schema Verified.");
+    const url = process.env.DATABASE_URL || '(unset)';
+    const mode = await prisma.$queryRawUnsafe<Array<{ journal_mode: string }>>('PRAGMA journal_mode;');
+    console.log(`⚡ SQLite ready — ${url} (journal_mode=${mode?.[0]?.journal_mode ?? '?'})`);
   } catch (err) {
-    console.error("❌ Database initialization failure:", err);
+    console.error('❌ Database initialization failure:', err);
+    throw err;
   }
 }
+
+export async function disconnectDatabase(): Promise<void> {
+  await prisma.$disconnect();
+}
+
+// Backwards-compatibility shim.
+//
+// The old module exported a pg Pool as `db` and call sites used
+// `db.query(sql, params)`. Everything in src/ has been migrated to Prisma, but
+// this keeps any straggler (or a cherry-picked upstream patch that still uses
+// raw SQL) from failing at runtime. Postgres-style $1/$2 placeholders are
+// rewritten to SQLite's ? form.
+export const db = {
+  async query<T = any>(sql: string, params: any[] = []): Promise<{ rows: T[] }> {
+    const sqliteSql = sql.replace(/\$(\d+)/g, '?');
+    const trimmed = sqliteSql.trim().toUpperCase();
+    if (trimmed.startsWith('SELECT') || trimmed.includes('RETURNING')) {
+      const rows = await prisma.$queryRawUnsafe<T[]>(sqliteSql, ...params);
+      return { rows };
+    }
+    await prisma.$executeRawUnsafe(sqliteSql, ...params);
+    return { rows: [] };
+  },
+};

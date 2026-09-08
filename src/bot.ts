@@ -11,7 +11,7 @@ import { TokenSignal } from './types';
 import { saveEncryptedWallet, loadDecryptedWallet } from './wallet';
 import { saveSetting, loadSettings, BotSettings, DEFAULT_SETTINGS } from './settings';
 import Redis from 'ioredis';
-import { db, initDatabaseSchema } from './db';
+import { prisma, initDatabaseSchema } from './db';
 import { renderExitCard, renderMilestoneCard, renderRecapCard, renderCallResultCard } from './cards';
 // import { startPonsFactoryListener, runPonsScan, stopPonsFactoryListener } from './robinhood';
 
@@ -190,7 +190,12 @@ function setAlert(address: string, rec: AlertRecord) {
   dirtyAddresses.add(address);
 }
 
-// ✅ Load history from Redis first, then Supabase as fallback
+const EXIT_REASONS = ['TP', 'SL', 'OPEN'] as const;
+
+// ── History persistence: Redis (hot cache) -> SQLite via Prisma (durable) ──
+// Redis stays an optional accelerator; SQLite is the source of truth. If no
+// REDIS_URL is configured the bot runs perfectly well on SQLite alone, which
+// is the expected single-container setup on a VPS.
 async function loadHistory() {
   try {
     const data = await redis.get('bot_history');
@@ -200,42 +205,55 @@ async function loadHistory() {
       return;
     }
   } catch (e) {
-    console.log('⚠️ Redis load failed, trying Supabase...');
+    console.log('⚠️ Redis load failed, falling back to SQLite...');
   }
 
-  // ✅ Supabase fallback
   try {
-    const result = await db.query(` SELECT address, ticker, alert_time, alert_mcap, alert_price, peak_mcap, peak_price, peak_time, current_mcap, current_price, last_updated, exit_reason, exit_price, exit_mcap, exit_time, milestones_hit FROM alert_history ORDER BY alert_time DESC LIMIT 500 `);
-    for (const row of result.rows) {
+    const rows = await prisma.alertHistory.findMany({
+      orderBy: { alertTime: 'desc' },
+      take: 500,
+    });
+    for (const row of rows) {
+      let milestones: number[] = [];
+      try {
+        // Stored as a JSON string: SQLite has no native JSON column type.
+        const parsed = JSON.parse(row.milestonesHit || '[]');
+        if (Array.isArray(parsed)) milestones = parsed;
+      } catch {}
+
       alertHistory.set(row.address, {
-        ticker: row.ticker,
+        ticker: row.ticker || '',
         address: row.address,
-        alertTime: Number(row.alert_time),
-        alertMcap: Number(row.alert_mcap),
-        alertPrice: Number(row.alert_price),
-        peakMcap: Number(row.peak_mcap),
-        // ── Finding 10: NULL peak_price falls back to alert_price, not 0 ──
-        peakPrice: Number(row.peak_price) || Number(row.alert_price) || 0,
-        peakTime: Number(row.peak_time),
-        currentMcap: Number(row.current_mcap),
-        currentPrice: Number(row.current_price),
-        lastUpdated: Number(row.last_updated),
-        exitReason: row.exit_reason || undefined,
-        exitPrice: row.exit_price != null ? Number(row.exit_price) : undefined,
-        exitMcap: row.exit_mcap != null ? Number(row.exit_mcap) : undefined,
-        exitTime: row.exit_time != null ? Number(row.exit_time) : undefined,
-        milestonesHit: Array.isArray(row.milestones_hit) ? row.milestones_hit : []
+        alertTime: Number(row.alertTime),
+        alertMcap: Number(row.alertMcap),
+        alertPrice: Number(row.alertPrice),
+        peakMcap: Number(row.peakMcap),
+        // NULL peak_price falls back to alert_price, not 0.
+        peakPrice: Number(row.peakPrice) || Number(row.alertPrice) || 0,
+        peakTime: Number(row.peakTime),
+        currentMcap: Number(row.currentMcap),
+        currentPrice: Number(row.currentPrice),
+        lastUpdated: Number(row.lastUpdated),
+        // SQLite hands back a plain string; validate it against the union
+        // rather than casting, so a corrupt/legacy value degrades to undefined
+        // instead of silently typing as a valid exit reason.
+        exitReason: EXIT_REASONS.includes(row.exitReason as any)
+          ? (row.exitReason as 'TP' | 'SL' | 'OPEN')
+          : undefined,
+        exitPrice: row.exitPrice != null ? Number(row.exitPrice) : undefined,
+        exitMcap: row.exitMcap != null ? Number(row.exitMcap) : undefined,
+        exitTime: row.exitTime != null ? Number(row.exitTime) : undefined,
+        milestonesHit: milestones,
       });
     }
-    console.log(`✅ History loaded from Supabase: ${alertHistory.size} records`);
+    console.log(`✅ History loaded from SQLite: ${alertHistory.size} records`);
   } catch (e: any) {
-    console.log(`⚠️ Supabase load failed: ${e.message}`);
+    console.log(`⚠️ SQLite history load failed: ${e.message}`);
   }
 }
 
-// ✅ Save to both Redis and Supabase — only dirty records hit Postgres
+// Only addresses touched since the last save are written back.
 async function saveHistory() {
-  // Redis save — full snapshot, cheap as a single write
   try {
     await redis.set('bot_history', JSON.stringify(Array.from(alertHistory.entries())));
   } catch (e: any) {
@@ -244,7 +262,6 @@ async function saveHistory() {
 
   if (dirtyAddresses.size === 0) return;
 
-  // Supabase save — upsert only what changed since the last save
   for (const address of Array.from(dirtyAddresses)) {
     const rec = alertHistory.get(address);
     if (!rec) {
@@ -252,15 +269,46 @@ async function saveHistory() {
       continue;
     }
     try {
-      await db.query(` INSERT INTO alert_history ( address, ticker, alert_time, alert_mcap, alert_price, peak_mcap, peak_price, peak_time, current_mcap, current_price, last_updated, exit_reason, exit_price, exit_mcap, exit_time, milestones_hit ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) ON CONFLICT (address) DO UPDATE SET peak_mcap = GREATEST(alert_history.peak_mcap, EXCLUDED.peak_mcap), peak_price = GREATEST(alert_history.peak_price, EXCLUDED.peak_price), peak_time = CASE WHEN EXCLUDED.peak_price > alert_history.peak_price THEN EXCLUDED.peak_time ELSE alert_history.peak_time END, current_mcap = EXCLUDED.current_mcap, current_price = EXCLUDED.current_price, last_updated = EXCLUDED.last_updated, exit_reason = EXCLUDED.exit_reason, exit_price = EXCLUDED.exit_price, exit_mcap = EXCLUDED.exit_mcap, exit_time = EXCLUDED.exit_time, milestones_hit = EXCLUDED.milestones_hit `, [
-        rec.address, rec.ticker, rec.alertTime, rec.alertMcap, rec.alertPrice,
-        rec.peakMcap, rec.peakPrice, rec.peakTime, rec.currentMcap, rec.currentPrice, rec.lastUpdated,
-        rec.exitReason || null, rec.exitPrice ?? null, rec.exitMcap ?? null, rec.exitTime ?? null,
-        JSON.stringify(rec.milestonesHit || [])
-      ]);
+      // The old raw SQL used GREATEST(...) / CASE in an ON CONFLICT clause to
+      // make peaks monotonic. Prisma has no portable equivalent, so the same
+      // guarantee is enforced here: read the stored row and never let a peak
+      // move backwards, and only advance peak_time when the peak price itself
+      // actually improved.
+      const existing = await prisma.alertHistory.findUnique({ where: { address } });
+
+      const peakPrice = Math.max(Number(rec.peakPrice) || 0, Number(existing?.peakPrice) || 0);
+      const peakMcap = Math.max(Number(rec.peakMcap) || 0, Number(existing?.peakMcap) || 0);
+      const peakTime =
+        (Number(rec.peakPrice) || 0) > (Number(existing?.peakPrice) || 0)
+          ? rec.peakTime
+          : existing?.peakTime ?? rec.peakTime;
+
+      const data = {
+        ticker: rec.ticker,
+        alertTime: rec.alertTime,
+        alertMcap: rec.alertMcap,
+        alertPrice: rec.alertPrice,
+        peakMcap,
+        peakPrice,
+        peakTime,
+        currentMcap: rec.currentMcap,
+        currentPrice: rec.currentPrice,
+        lastUpdated: rec.lastUpdated,
+        exitReason: rec.exitReason ?? null,
+        exitPrice: rec.exitPrice ?? null,
+        exitMcap: rec.exitMcap ?? null,
+        exitTime: rec.exitTime ?? null,
+        milestonesHit: JSON.stringify(rec.milestonesHit || []),
+      };
+
+      await prisma.alertHistory.upsert({
+        where: { address },
+        create: { address, ...data },
+        update: data,
+      });
       dirtyAddresses.delete(address);
     } catch (e: any) {
-      console.log(`⚠️ Supabase save failed for ${address}: ${e.message}`);
+      console.log(`⚠️ SQLite history save failed for ${address}: ${e.message}`);
     }
   }
 }
@@ -1135,19 +1183,8 @@ async function scan() {
 async function init() {
   await initDatabaseSchema();
 
-  // ✅ Create alert_history table if not exists
-  try {
-    await db.query(` CREATE TABLE IF NOT EXISTS alert_history ( address TEXT PRIMARY KEY, ticker TEXT, alert_time BIGINT, alert_mcap NUMERIC, alert_price NUMERIC, peak_mcap NUMERIC, peak_price NUMERIC, peak_time BIGINT, current_mcap NUMERIC, current_price NUMERIC, last_updated BIGINT, exit_reason TEXT, exit_price NUMERIC, exit_mcap NUMERIC, exit_time BIGINT ); `);
-    // ── Finding 1: backfill exit columns on tables created before this fix ──
-    await db.query(`ALTER TABLE alert_history ADD COLUMN IF NOT EXISTS exit_reason TEXT`);
-    await db.query(`ALTER TABLE alert_history ADD COLUMN IF NOT EXISTS exit_price NUMERIC`);
-    await db.query(`ALTER TABLE alert_history ADD COLUMN IF NOT EXISTS exit_mcap NUMERIC`);
-    await db.query(`ALTER TABLE alert_history ADD COLUMN IF NOT EXISTS exit_time BIGINT`);
-    await db.query(`ALTER TABLE alert_history ADD COLUMN IF NOT EXISTS milestones_hit JSONB DEFAULT '[]'::jsonb`);
-    console.log('✅ alert_history table ready');
-  } catch (e: any) {
-    console.log(`⚠️ alert_history table setup failed: ${e.message}`);
-  }
+  // Schema (alert_history included) is owned by Prisma migrations, applied by
+  // `prisma migrate deploy` on container start — no runtime DDL any more.
 
   // ✅ Load encrypted wallet + bot settings from DB
   if (CHAT_ID) {

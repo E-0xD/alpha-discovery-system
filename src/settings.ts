@@ -1,4 +1,6 @@
-import { db } from './db';
+import { prisma } from './db';
+
+export type TradingMode = 'LIVE' | 'DEMO';
 
 export interface BotSettings {
   tradeSizeSol: number;
@@ -8,6 +10,7 @@ export interface BotSettings {
   delayedEntryMcap: number;
   robinhoodEnabled: boolean;
   slippageBps: number;
+  tradingMode: TradingMode;
 }
 
 export const DEFAULT_SETTINGS: BotSettings = {
@@ -18,43 +21,36 @@ export const DEFAULT_SETTINGS: BotSettings = {
   delayedEntryMcap: 15000,
   robinhoodEnabled: true,
   slippageBps: 1000,
+  // Deliberately defaults to DEMO. A fresh install (or a wiped volume) must
+  // never start firing real buys before the operator has explicitly opted in.
+  tradingMode: 'DEMO',
 };
 
-export async function saveSetting(chatId: string, key: keyof BotSettings, value: number | boolean): Promise<void> {
-  const colMap: Record<keyof BotSettings, string> = {
-    tradeSizeSol: 'trade_size_sol',
-    takeProfitPct: 'take_profit_pct',
-    stopLossPct: 'stop_loss_pct',
-    delayedEntryEnabled: 'delayed_entry_enabled',
-    delayedEntryMcap: 'delayed_entry_mcap',
-    robinhoodEnabled: 'robinhood_enabled',
-    slippageBps: 'slippage_bps',
-  };
-  const col = colMap[key];
-  await db.query(
-    `INSERT INTO bot_settings (chat_id, ${col})
-     VALUES ($1, $2)
-     ON CONFLICT (chat_id) DO UPDATE SET ${col} = EXCLUDED.${col}, updated_at = NOW()`,
-    [chatId, value]
-  );
+export async function saveSetting(
+  chatId: string,
+  key: keyof BotSettings,
+  value: number | boolean | string
+): Promise<void> {
+  await prisma.botSetting.upsert({
+    where: { chatId },
+    create: { chatId, [key]: value } as any,
+    update: { [key]: value } as any,
+  });
 }
 
 export async function loadSettings(chatId: string): Promise<BotSettings> {
   try {
-    const res = await db.query(
-      'SELECT trade_size_sol, take_profit_pct, stop_loss_pct, delayed_entry_enabled, delayed_entry_mcap, robinhood_enabled, slippage_bps FROM bot_settings WHERE chat_id = $1',
-      [chatId]
-    );
-    if (!res.rows.length) return { ...DEFAULT_SETTINGS };
-    const r = res.rows[0];
+    const r = await prisma.botSetting.findUnique({ where: { chatId } });
+    if (!r) return { ...DEFAULT_SETTINGS };
     return {
-      tradeSizeSol: Number(r.trade_size_sol) || DEFAULT_SETTINGS.tradeSizeSol,
-      takeProfitPct: Number(r.take_profit_pct) || DEFAULT_SETTINGS.takeProfitPct,
-      stopLossPct: Number(r.stop_loss_pct) || DEFAULT_SETTINGS.stopLossPct,
-      delayedEntryEnabled: r.delayed_entry_enabled ?? DEFAULT_SETTINGS.delayedEntryEnabled,
-      delayedEntryMcap: Number(r.delayed_entry_mcap) || DEFAULT_SETTINGS.delayedEntryMcap,
-      robinhoodEnabled: r.robinhood_enabled ?? DEFAULT_SETTINGS.robinhoodEnabled,
-      slippageBps: Number(r.slippage_bps) || DEFAULT_SETTINGS.slippageBps,
+      tradeSizeSol: Number(r.tradeSizeSol) || DEFAULT_SETTINGS.tradeSizeSol,
+      takeProfitPct: Number(r.takeProfitPct) || DEFAULT_SETTINGS.takeProfitPct,
+      stopLossPct: Number(r.stopLossPct) || DEFAULT_SETTINGS.stopLossPct,
+      delayedEntryEnabled: r.delayedEntryEnabled ?? DEFAULT_SETTINGS.delayedEntryEnabled,
+      delayedEntryMcap: Number(r.delayedEntryMcap) || DEFAULT_SETTINGS.delayedEntryMcap,
+      robinhoodEnabled: r.robinhoodEnabled ?? DEFAULT_SETTINGS.robinhoodEnabled,
+      slippageBps: Number(r.slippageBps) || DEFAULT_SETTINGS.slippageBps,
+      tradingMode: r.tradingMode === 'LIVE' ? 'LIVE' : 'DEMO',
     };
   } catch {
     return { ...DEFAULT_SETTINGS };
