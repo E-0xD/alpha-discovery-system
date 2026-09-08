@@ -19,7 +19,25 @@ import { prisma, initDatabaseSchema } from './db';
 import { renderExitCard, renderMilestoneCard, renderRecapCard, renderCallResultCard } from './cards';
 // import { startPonsFactoryListener, runPonsScan, stopPonsFactoryListener } from './robinhood';
 
-const redis = new Redis(process.env.REDIS_URL || '');
+// Redis is an optional accelerator, not a dependency. SQLite is the source of
+// truth for history, and the cross-instance dedup it used to provide is moot
+// now that SQLite pins this to a single container.
+//
+// `new Redis('')` does NOT mean "disabled" — ioredis falls back to
+// localhost:6379 and then retries forever, flooding the log with ECONNREFUSED
+// on any host without Redis. So when REDIS_URL is unset we substitute a no-op
+// that satisfies the two call sites and never opens a socket.
+const redis: { get(k: string): Promise<string | null>; set(k: string, v: string): Promise<unknown> } =
+  process.env.REDIS_URL
+    ? new Redis(process.env.REDIS_URL)
+    : {
+        async get() { return null; },
+        async set() { return null; },
+      };
+
+if (!process.env.REDIS_URL) {
+  console.log('Redis not configured — using SQLite alone (expected on a single-container deploy).');
+}
 
 dotenv.config();
 
@@ -93,7 +111,26 @@ async function getTokenLogoUrl(address: string): Promise<string | undefined> {
     return undefined;
   }
 }
-const DOMAIN = process.env.RAILWAY_STATIC_URL || process.env.RENDER_EXTERNAL_URL || 'https://alpha-discovery-system.onrender.com';
+// Public HTTPS origin Telegram will POST webhook updates to.
+//
+// This used to fall back to a hard-coded Render URL. On any other host that
+// silently registered the webhook against someone else's domain, so the bot
+// came up "healthy" and simply never received a single update. Failing loudly
+// is far better than that, so an unset domain is fatal.
+const DOMAIN =
+  process.env.PUBLIC_URL ||
+  process.env.APP_URL ||
+  process.env.RAILWAY_STATIC_URL ||
+  process.env.RENDER_EXTERNAL_URL ||
+  '';
+
+if (!DOMAIN) {
+  console.error(
+    'FATAL: no public URL set. Set PUBLIC_URL to this service public HTTPS origin ' +
+    '(e.g. https://bot.yourdomain.com) so Telegram can deliver webhook updates.'
+  );
+  process.exit(1);
+}
 const seenTokens = new Set<string>();
 const seenTokensQueue: string[] = [];
 const wssPumpTokensQueue: any[] = [];
