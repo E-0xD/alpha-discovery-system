@@ -451,165 +451,81 @@ function startPumpPortalStream() {
   ws.on('error', (err: any) => console.error("⚠️ WSS Error:", err.message));
 }
 
+// ── Price micro-cache ─────────────────────────────────────────────────────────
+// The fast risk loop polls the same handful of tokens every second, and the
+// slow loop often asks for the same price moments later. A short TTL collapses
+// those into a single upstream call without meaningfully staling the risk
+// check, and keeps us well inside Jupiter/pump.fun rate limits.
+const PRICE_CACHE_TTL_MS = Number(process.env.PRICE_CACHE_TTL_MS || '600');
+const PRICE_TIMEOUT_MS = Number(process.env.PRICE_TIMEOUT_MS || '2500');
+const priceCache = new Map<string, { price: number; mcap: number; at: number }>();
+
+const PRICE_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36';
+
 async function getLivePrice(address: string): Promise<{ price: number; mcap: number }> {
-  try {
-    const jupRes = await axios.get(`https://api.jup.ag/price/v2?ids=${address}`, { timeout: 4000 });
-    const jupPrice = parseFloat(jupRes.data?.data?.[address]?.price || '0');
-    if (jupPrice > 0) {
-      try {
-        const pumpRes = await axios.get(`https://frontend-api.pump.fun/coins/${address}`, {
-          timeout: 3000,
-          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36' }
-        });
-        return { price: jupPrice, mcap: parseFloat(pumpRes.data?.usd_market_cap || '0') };
-      } catch {
-        return { price: jupPrice, mcap: 0 };
-      }
-    }
-  } catch {}
+  const cached = priceCache.get(address);
+  if (cached && Date.now() - cached.at < PRICE_CACHE_TTL_MS) {
+    return { price: cached.price, mcap: cached.mcap };
+  }
 
-  try {
-    const pumpRes = await axios.get(`https://frontend-api.pump.fun/coins/${address}`, {
-      timeout: 4000,
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36' }
-    });
-    const price = parseFloat(pumpRes.data?.price || pumpRes.data?.sol_price || '0');
-    const mcap = parseFloat(pumpRes.data?.usd_market_cap || '0');
-    if (price > 0) return { price, mcap };
-  } catch {}
+  // Jupiter and pump.fun are fired together rather than in sequence. The old
+  // path awaited Jupiter, then pump.fun for the mcap, so a slow Jupiter
+  // response was added directly onto stop-loss latency; with every fallback
+  // timing out the worst case was 4s + 3s + 4s + 5s = 16 seconds.
+  const [jup, pump] = await Promise.allSettled([
+    axios.get(`https://api.jup.ag/price/v2?ids=${address}`, { timeout: PRICE_TIMEOUT_MS }),
+    axios.get(`https://frontend-api.pump.fun/coins/${address}`, {
+      timeout: PRICE_TIMEOUT_MS,
+      headers: { 'User-Agent': PRICE_UA },
+    }),
+  ]);
 
+  const jupPrice = jup.status === 'fulfilled'
+    ? parseFloat(jup.value.data?.data?.[address]?.price || '0')
+    : 0;
+  const pumpData = pump.status === 'fulfilled' ? pump.value.data : null;
+  const pumpPrice = parseFloat(pumpData?.price || pumpData?.sol_price || '0');
+  const pumpMcap = parseFloat(pumpData?.usd_market_cap || '0');
+
+  // Jupiter is the more reliable price; pump.fun supplies the market cap.
+  const price = jupPrice > 0 ? jupPrice : pumpPrice;
+  if (price > 0) {
+    const out = { price, mcap: pumpMcap > 0 ? pumpMcap : 0 };
+    priceCache.set(address, { ...out, at: Date.now() });
+    return out;
+  }
+
+  // DexScreener only when both primaries gave nothing -- it is the slowest of
+  // the three and must never sit in the hot path.
   try {
     const dexRes = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${address}`, { timeout: 5000 });
     const pair = dexRes.data?.pairs?.[0];
-    const price = parseFloat(pair?.priceUsd || '0');
-    const mcap = parseFloat(pair?.fdv || pair?.marketCap || '0');
-    if (price > 0) return { price, mcap };
+    const dexPrice = parseFloat(pair?.priceUsd || '0');
+    const dexMcap = parseFloat(pair?.fdv || pair?.marketCap || '0');
+    if (dexPrice > 0) {
+      const out = { price: dexPrice, mcap: dexMcap };
+      priceCache.set(address, { ...out, at: Date.now() });
+      return out;
+    }
   } catch {}
 
   return { price: 0, mcap: 0 };
 }
 
-async function monitorPositions() {
-  const now = Date.now();
-  const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
-
-  const recentAlerts = [...alertHistory.keys()].filter(addr => {
-    const rec = alertHistory.get(addr);
-    return rec && (now - rec.alertTime) < TWENTY_FOUR_HOURS;
-  });
-
-  // Drop pending entries whose alert has aged out of the 24h tracking window
-  for (const addr of pendingEntries.keys()) {
-    if (!recentAlerts.includes(addr)) pendingEntries.delete(addr);
-  }
-
-  const allAddresses = new Set([...openPositions.keys(), ...recentAlerts, ...pendingEntries.keys()]);
-  if (allAddresses.size === 0) return;
-
-  await Promise.all(Array.from(allAddresses).map(async (address) => {
-    try {
-      const { price: currentPrice, mcap: currentMcap } = await getLivePrice(address);
-      if (!currentPrice) return;
-
-      if (pendingEntries.has(address) && currentMcap >= botSettings.delayedEntryMcap) {
-        const pending = pendingEntries.get(address)!;
-        pendingEntries.delete(address);
-        if (executor.hasWallet() || botSettings.tradingMode === 'DEMO') {
-          try {
-            const tradeSol = botSettings.tradeSizeSol;
-            const result = await gateway.buy({
-              address,
-              ticker: pending.ticker,
-              sizeSol: tradeSol,
-              slippageBps: botSettings.slippageBps,
-              price: currentPrice,
-              mode: botSettings.tradingMode,
-              chatId: CHAT_ID,
-            });
-            if (result.success && currentPrice > 0) {
-              openPositions.set(address, {
-                ticker: pending.ticker, address,
-                entryPrice: currentPrice,
-                peakPrice: currentPrice,
-                sizeSol: tradeSol,
-                entryTime: now,
-                stopLossLevel: 'initial',
-                stopLossPct: -35,
-                remainingPct: 100,
-              });
-              const txLink = result.signature ? ` — [Solscan](https://solscan.io/tx/${result.signature})` : '';
-              await bot.telegram.sendMessage(CHAT_ID, [
-                `⏳➡️✅ *DELAYED ENTRY EXECUTED*`, ``,
-                `*Token:* $${escapeText(pending.ticker)}`,
-                `*Entry:* $${currentPrice.toFixed(8)} — MCAP $${currentMcap.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
-                `*Size:* ${tradeSol} SOL${txLink}`,
-              ].join('\n'), { parse_mode: 'Markdown' });
-              console.log(`📌 Delayed entry executed: ${pending.ticker} @ $${currentPrice} (mcap $${currentMcap})`);
-            } else {
-              console.log(`❌ Delayed entry buy failed for ${pending.ticker}: ${result.error || 'unknown error'}`);
-            }
-          } catch (e: any) {
-            console.log(`❌ Delayed entry error for ${pending.ticker}: ${e.message}`);
-          }
-        }
-      }
-
-      if (alertHistory.has(address)) {
-        const rec = alertHistory.get(address)!;
-        const updated: AlertRecord = { ...rec, currentPrice, currentMcap, lastUpdated: now, milestonesHit: rec.milestonesHit || [] };
-        if (currentPrice > rec.peakPrice) {
-          updated.peakPrice = currentPrice;
-          updated.peakMcap = currentMcap;
-          updated.peakTime = now;
-          console.log(`📈 New peak ${rec.ticker}: $${currentPrice.toFixed(8)} (+${(((currentPrice - rec.alertPrice) / rec.alertPrice) * 100).toFixed(1)}%)`);
-        }
-
-        // ── Milestone announcements — fire once per threshold, based on peak reached ──
-        if (rec.alertPrice > 0) {
-          const gainMultiple = updated.peakPrice / rec.alertPrice;
-          for (const { multiple } of MILESTONE_THRESHOLDS) {
-            if (gainMultiple >= multiple && !updated.milestonesHit.includes(multiple)) {
-              updated.milestonesHit = [...updated.milestonesHit, multiple];
-
-              // ── +50% stays plain text — only 2x and above get an image card ──
-              if (multiple < 2) {
-                try {
-                  await bot.telegram.sendMessage(
-                    CHAT_ID,
-                    `🚀 *$${escapeText(rec.ticker)}* is now \\+50%`,
-                    { parse_mode: 'Markdown' }
-                  );
-                  console.log(`📢 Milestone (text): ${rec.ticker} hit ${multiple}x`);
-                } catch (e: any) {
-                  console.log(`⚠️ Failed to send milestone text: ${e.message}`);
-                }
-                continue;
-              }
-
-              try {
-                const logoUrl = await getTokenLogoUrl(address);
-                const card = await renderMilestoneCard({
-                  botName: DENGINE_NAME,
-                  ticker: rec.ticker,
-                  multiple,
-                  alertMcap: rec.alertMcap,
-                  peakMcap: updated.peakMcap,
-                  pnlPct: ((updated.peakPrice - rec.alertPrice) / rec.alertPrice) * 100,
-                  heldMinutes: Math.floor((now - rec.alertTime) / 60000),
-                  logoUrl,
-                });
-                await bot.telegram.sendPhoto(CHAT_ID, { source: card });
-                console.log(`📢 Milestone (card): ${rec.ticker} hit ${multiple}x`);
-              } catch (e: any) {
-                console.log(`⚠️ Failed to send milestone card: ${e.message}`);
-              }
-            }
-          }
-        }
-
-        setAlert(address, updated);
-      }
-
+/**
+ * Take-profit / stop-loss evaluation for a single open position.
+ *
+ * Extracted out of monitorPositions() so the fast risk loop can own it. This
+ * used to run on the same 30s timer as milestone cards and alert tracking,
+ * which meant a stop-loss could fire up to 30 seconds late -- and ~29s of
+ * that was purely the polling gap, not the chain.
+ */
+async function evaluateOpenPosition(
+  address: string,
+  currentPrice: number,
+  currentMcap: number,
+  now: number
+): Promise<void> {
       if (openPositions.has(address)) {
         const pos = openPositions.get(address)!;
         const updated = { ...pos };
@@ -769,6 +685,170 @@ async function monitorPositions() {
 
         openPositions.set(address, updated);
       }
+}
+
+// Guards against a slow cycle overlapping the next tick. Without this a
+// 1s interval over a stalled RPC would pile up concurrent sells for the
+// same position.
+// Loop cadences. RISK_LOOP_MS is the dominant term in stop-loss latency:
+// it is how long a position can sit un-checked after a price move. Sub-second
+// values are allowed but hit upstream rate limits with several open
+// positions -- 1s is the sweet spot.
+const RISK_LOOP_MS = Number(process.env.RISK_LOOP_MS || '1000');
+const MONITOR_LOOP_MS = Number(process.env.MONITOR_LOOP_MS || '30000');
+
+let riskLoopRunning = false;
+
+/**
+ * Fast risk loop: open positions only.
+ *
+ * Deliberately does NOT touch alertHistory (up to 500 tokens) or render
+ * milestone cards -- those stay on the slow 30s loop. Open positions are
+ * typically a handful of tokens, which is what makes a ~1s poll affordable
+ * without tripping Jupiter/pump.fun rate limits.
+ */
+async function monitorRisk(): Promise<void> {
+  if (riskLoopRunning) return;
+  riskLoopRunning = true;
+  try {
+    const addresses = Array.from(openPositions.keys());
+    if (addresses.length === 0) return;
+    const now = Date.now();
+    await Promise.all(addresses.map(async (address) => {
+      try {
+        const { price, mcap } = await getLivePrice(address);
+        if (!price) return;
+        await evaluateOpenPosition(address, price, mcap, now);
+      } catch (e: any) {
+        console.log(`Risk loop error ${address}: ${e.message}`);
+      }
+    }));
+  } finally {
+    riskLoopRunning = false;
+  }
+}
+
+async function monitorPositions() {
+  const now = Date.now();
+  const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
+
+  const recentAlerts = [...alertHistory.keys()].filter(addr => {
+    const rec = alertHistory.get(addr);
+    return rec && (now - rec.alertTime) < TWENTY_FOUR_HOURS;
+  });
+
+  // Drop pending entries whose alert has aged out of the 24h tracking window
+  for (const addr of pendingEntries.keys()) {
+    if (!recentAlerts.includes(addr)) pendingEntries.delete(addr);
+  }
+
+  const allAddresses = new Set([...openPositions.keys(), ...recentAlerts, ...pendingEntries.keys()]);
+  if (allAddresses.size === 0) return;
+
+  await Promise.all(Array.from(allAddresses).map(async (address) => {
+    try {
+      const { price: currentPrice, mcap: currentMcap } = await getLivePrice(address);
+      if (!currentPrice) return;
+
+      if (pendingEntries.has(address) && currentMcap >= botSettings.delayedEntryMcap) {
+        const pending = pendingEntries.get(address)!;
+        pendingEntries.delete(address);
+        if (executor.hasWallet() || botSettings.tradingMode === 'DEMO') {
+          try {
+            const tradeSol = botSettings.tradeSizeSol;
+            const result = await gateway.buy({
+              address,
+              ticker: pending.ticker,
+              sizeSol: tradeSol,
+              slippageBps: botSettings.slippageBps,
+              price: currentPrice,
+              mode: botSettings.tradingMode,
+              chatId: CHAT_ID,
+            });
+            if (result.success && currentPrice > 0) {
+              openPositions.set(address, {
+                ticker: pending.ticker, address,
+                entryPrice: currentPrice,
+                peakPrice: currentPrice,
+                sizeSol: tradeSol,
+                entryTime: now,
+                stopLossLevel: 'initial',
+                stopLossPct: -35,
+                remainingPct: 100,
+              });
+              const txLink = result.signature ? ` — [Solscan](https://solscan.io/tx/${result.signature})` : '';
+              await bot.telegram.sendMessage(CHAT_ID, [
+                `⏳➡️✅ *DELAYED ENTRY EXECUTED*`, ``,
+                `*Token:* $${escapeText(pending.ticker)}`,
+                `*Entry:* $${currentPrice.toFixed(8)} — MCAP $${currentMcap.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
+                `*Size:* ${tradeSol} SOL${txLink}`,
+              ].join('\n'), { parse_mode: 'Markdown' });
+              console.log(`📌 Delayed entry executed: ${pending.ticker} @ $${currentPrice} (mcap $${currentMcap})`);
+            } else {
+              console.log(`❌ Delayed entry buy failed for ${pending.ticker}: ${result.error || 'unknown error'}`);
+            }
+          } catch (e: any) {
+            console.log(`❌ Delayed entry error for ${pending.ticker}: ${e.message}`);
+          }
+        }
+      }
+
+      if (alertHistory.has(address)) {
+        const rec = alertHistory.get(address)!;
+        const updated: AlertRecord = { ...rec, currentPrice, currentMcap, lastUpdated: now, milestonesHit: rec.milestonesHit || [] };
+        if (currentPrice > rec.peakPrice) {
+          updated.peakPrice = currentPrice;
+          updated.peakMcap = currentMcap;
+          updated.peakTime = now;
+          console.log(`📈 New peak ${rec.ticker}: $${currentPrice.toFixed(8)} (+${(((currentPrice - rec.alertPrice) / rec.alertPrice) * 100).toFixed(1)}%)`);
+        }
+
+        // ── Milestone announcements — fire once per threshold, based on peak reached ──
+        if (rec.alertPrice > 0) {
+          const gainMultiple = updated.peakPrice / rec.alertPrice;
+          for (const { multiple } of MILESTONE_THRESHOLDS) {
+            if (gainMultiple >= multiple && !updated.milestonesHit.includes(multiple)) {
+              updated.milestonesHit = [...updated.milestonesHit, multiple];
+
+              // ── +50% stays plain text — only 2x and above get an image card ──
+              if (multiple < 2) {
+                try {
+                  await bot.telegram.sendMessage(
+                    CHAT_ID,
+                    `🚀 *$${escapeText(rec.ticker)}* is now \\+50%`,
+                    { parse_mode: 'Markdown' }
+                  );
+                  console.log(`📢 Milestone (text): ${rec.ticker} hit ${multiple}x`);
+                } catch (e: any) {
+                  console.log(`⚠️ Failed to send milestone text: ${e.message}`);
+                }
+                continue;
+              }
+
+              try {
+                const logoUrl = await getTokenLogoUrl(address);
+                const card = await renderMilestoneCard({
+                  botName: DENGINE_NAME,
+                  ticker: rec.ticker,
+                  multiple,
+                  alertMcap: rec.alertMcap,
+                  peakMcap: updated.peakMcap,
+                  pnlPct: ((updated.peakPrice - rec.alertPrice) / rec.alertPrice) * 100,
+                  heldMinutes: Math.floor((now - rec.alertTime) / 60000),
+                  logoUrl,
+                });
+                await bot.telegram.sendPhoto(CHAT_ID, { source: card });
+                console.log(`📢 Milestone (card): ${rec.ticker} hit ${multiple}x`);
+              } catch (e: any) {
+                console.log(`⚠️ Failed to send milestone card: ${e.message}`);
+              }
+            }
+          }
+        }
+
+        setAlert(address, updated);
+      }
+
     } catch (err: any) {
       console.log(`❌ Monitor error ${address}: ${err.message}`);
     }
@@ -1260,7 +1340,12 @@ bot.launch({
   // }
   scan();
   setInterval(scan, 60000);
-  setInterval(monitorPositions, 30 * 1000);
+  // Slow loop: alert tracking, milestone cards, delayed entries.
+  setInterval(monitorPositions, MONITOR_LOOP_MS);
+  // Fast loop: open-position TP/SL only. This is the single biggest latency
+  // win -- stop-loss detection drops from a worst case of ~30s to ~1s.
+  setInterval(monitorRisk, RISK_LOOP_MS);
+  console.log(`Risk loop ${RISK_LOOP_MS}ms | monitor loop ${MONITOR_LOOP_MS}ms | mode ${botSettings.tradingMode}`);
   // ── Calendar-aligned: 12h digest fires at 00:00 & 12:00 UTC, daily recap at
   // midnight UTC, weekly digest Sunday midnight UTC — not rolling from restart time ──
   scheduleTwiceDaily(() => postTopGainers(12 * 60 * 60 * 1000, 'Last 12 Hours'));
