@@ -17,7 +17,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { execFileSync } = require('child_process');
+const { execFileSync, execSync } = require('child_process');
 
 const ROOT = path.resolve(__dirname, '..');
 const ENV_PATH = path.join(ROOT, '.env');
@@ -174,6 +174,33 @@ else info('no Jupiter add-on — using the public rate-limited endpoint');
 
 if ((process.env.REDIS_URL || '').trim()) ok('Redis configured');
 else info('no Redis — running on SQLite alone (correct for one container)');
+
+// -- Lock file guard ---------------------------------------------------------
+// `npm ci` in Docker is strict: package.json and package-lock.json must agree
+// exactly, or the build dies with EUSAGE before a single line of code runs.
+// Catching it here means finding out locally in a second rather than after a
+// four-minute deploy.
+try {
+  // execSync with a single string, not execFileSync with shell:true — the
+  // latter warns (DEP0190) because args are concatenated rather than escaped.
+  // A shell is needed at all because npm is a .cmd shim on Windows, which
+  // Node 20+ refuses to execFile directly, and npm is not vendored inside
+  // node_modules so it must come from PATH. No user input reaches this string.
+  execSync('npm ci --dry-run --ignore-scripts --no-audit --no-fund', {
+    cwd: ROOT,
+    stdio: 'pipe',
+  });
+  ok('package-lock.json is in sync (npm ci will succeed)');
+} catch (e) {
+  const out = ((e.stdout || '') + (e.stderr || '')).toString();
+  if (out.includes('EUSAGE') || out.includes('can only install packages when')) {
+    warn('package-lock.json is OUT OF SYNC with package.json');
+    warn('Docker builds will fail at `npm ci`. Fix with:  npm install');
+    const miss = out.match(/Missing: \S+/g);
+    if (miss) miss.slice(0, 5).forEach((m2) => warn('  ' + m2));
+  }
+  // Any other failure (npm not vendored, offline) is not worth blocking on.
+}
 
 // ── Drift guard ──────────────────────────────────────────────────────────────
 // GROQ_API_KEY was read by the code but absent from .env.example, so there was

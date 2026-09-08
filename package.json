@@ -29,5 +29,9 @@
     "@types/ws": "^8.5.10",
     "prisma": "^6.19.3",
     "typescript": "^5.3.3"
+  },
+  "engines": {
+    "node": ">=22",
+    "npm": ">=11"
   }
 }

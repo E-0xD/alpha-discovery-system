@@ -9,8 +9,15 @@
 # containers writing the same database file will corrupt it.
 # ─────────────────────────────────────────────────────────────────────────────
 
-FROM node:22-slim AS builder
+FROM node:24-slim AS builder
 WORKDIR /app
+
+# npm major must match the one that wrote package-lock.json. `npm ci` is
+# strict: npm 10 and npm 11 disagree about this tree (npm 10 demands a nested
+# utf-8-validate@5.0.10 that npm 11 does not record), so a lock written locally
+# on npm 11 fails to install on an image shipping npm 10. Pinning here makes
+# the build independent of whatever the base image happens to bundle.
+RUN npm install -g npm@11
 
 # openssl is required by Prisma's query engine.
 RUN apt-get update \
@@ -29,7 +36,7 @@ COPY src ./src
 RUN npx tsc
 
 
-FROM node:22-slim AS runtime
+FROM node:24-slim AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 
