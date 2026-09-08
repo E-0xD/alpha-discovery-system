@@ -30,6 +30,13 @@ fork with a deploy key).
 | Name | `bot-data` |
 | Destination Path | `/data` |
 
+**The mount path and `DATABASE_URL` must agree.** Mount at `/data` and set
+`DATABASE_URL=file:/data/bot.db`; if you prefer `/app/data`, mount there and set
+`file:/app/data/bot.db`. A mismatch means the database is written somewhere that
+isn't the volume, and every redeploy silently wipes it. The app creates the
+directory if it's missing, so a mismatch fails quietly rather than loudly —
+double-check this one.
+
 ## 3. Set the domain
 
 Coolify assigns a domain (or point your own at it). Whatever it ends up being,

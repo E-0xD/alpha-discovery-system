@@ -1,5 +1,7 @@
 import { PrismaClient } from '@prisma/client';
 import * as dotenv from 'dotenv';
+import * as fs from 'fs';
+import * as path from 'path';
 
 dotenv.config();
 
@@ -12,6 +14,32 @@ dotenv.config();
 if (!process.env.DATABASE_URL) {
   process.env.DATABASE_URL = 'file:./data/bot.db?connection_limit=1';
 }
+
+/**
+ * Make sure the directory holding the SQLite file exists.
+ *
+ * SQLite creates the database file but NOT its parent directory, so pointing
+ * DATABASE_URL at a path whose directory is missing (a volume mounted at
+ * /app/data when the image only created /data, say) fails at startup with an
+ * opaque error. Creating it here means any mount path works.
+ */
+function ensureSqliteDir(): void {
+  const url = process.env.DATABASE_URL || '';
+  if (!url.startsWith('file:')) return;
+  const filePath = url.slice('file:'.length).split('?')[0];
+  if (!filePath) return;
+  const dir = path.dirname(path.resolve(filePath));
+  try {
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+      console.log(`Created SQLite directory ${dir}`);
+    }
+  } catch (err: any) {
+    console.error(`Could not create SQLite directory ${dir}: ${err.message}`);
+  }
+}
+
+ensureSqliteDir();
 
 export const prisma = new PrismaClient({
   log: process.env.PRISMA_DEBUG === 'true' ? ['query', 'warn', 'error'] : ['warn', 'error'],
