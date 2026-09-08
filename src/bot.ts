@@ -115,16 +115,12 @@ async function getTokenLogoUrl(address: string): Promise<string | undefined> {
 }
 // Public HTTPS origin Telegram will POST webhook updates to.
 //
-// This used to fall back to a hard-coded Render URL. On any other host that
-// silently registered the webhook against someone else's domain, so the bot
-// came up "healthy" and simply never received a single update. Failing loudly
-// is far better than that, so an unset domain is fatal.
+// Unset is not an error — it just means polling (see BOT_MODE below), which
+// needs no public URL at all.
 const DOMAIN =
   process.env.PUBLIC_URL ||
   process.env.APP_URL ||
   process.env.WEBHOOK_URL ||
-  process.env.RAILWAY_STATIC_URL ||
-  process.env.RENDER_EXTERNAL_URL ||
   '';
 
 // Transport: webhook or long polling.
@@ -1468,14 +1464,6 @@ async function startBot(): Promise<void> {
   if (BOT_MODE === 'webhook') {
     await bot.launch({ webhook: { domain: DOMAIN, port: PORT } });
     console.log(`🤖 Bot live via webhook on ${DOMAIN} (port ${PORT})`);
-
-    // Keep-alive ping for free tiers that sleep idle services. Pointless
-    // without a public URL, so it is webhook-only.
-    setInterval(async () => {
-      try {
-        await axios.get(DOMAIN, { timeout: 5000 });
-      } catch {}
-    }, 5 * 60 * 1000);
   } else {
     startHealthServer();
     // Long polling opens an outbound connection to Telegram, so it needs no

@@ -6,7 +6,7 @@ import * as fs from 'fs';
 // ─────────────────────────────────────────────────────────────────────────
 // Card image generator for Dengine.
 //
-// FONT: headless Linux containers (Railway included) often ship with zero
+// FONT: headless Linux containers often ship with zero
 // system fonts — canvas doesn't error on this, it just silently draws no
 // text at all, which is why cards were showing as empty colored boxes.
 // Fix: bundle a font file directly in the repo so this never depends on
