@@ -1,0 +1,37 @@
+name: Mirror to private backup
+
+# Pushes a complete copy of this repository -- every branch and tag -- to a
+# private backup repo, so the code survives even if this fork is deleted,
+# detached, or taken down along with its upstream network.
+on:
+  push:
+  schedule:
+    - cron: '17 4 * * *'   # daily safety net, in case a push trigger is missed
+  workflow_dispatch:        # lets you fire it by hand from the Actions tab
+
+concurrency:
+  group: mirror-backup
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone full history (all branches and tags)
+        run: git clone --mirror "https://github.com/${GITHUB_REPOSITORY}.git" repo.git
+
+      - name: Authorise deploy key for the backup repo
+        env:
+          SSH_KEY: ${{ secrets.MIRROR_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Push mirror
+        run: |
+          cd repo.git
+          git remote set-url --push origin "git@github.com:${{ vars.BACKUP_REPO }}.git"
+          git push --mirror
+          echo "Mirrored $(git for-each-ref --format='%(refname:short)' refs/heads | wc -l) branch(es)."
