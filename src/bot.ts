@@ -7,6 +7,8 @@ import bs58 from 'bs58';
 import { OnChainPatternRecognition } from './intelligence';
 import { CapitalRiskEngine } from './risk';
 import { LowLatencyExecutionEngine } from './execution';
+import { TradeGateway, TradeResult } from './trading';
+import { getDemoBalance, ensureDemoAccount, adjustDemoBalance, resetDemoAccount } from './demo';
 import { TokenSignal } from './types';
 import { saveEncryptedWallet, loadDecryptedWallet } from './wallet';
 import { saveSetting, loadSettings, BotSettings, DEFAULT_SETTINGS } from './settings';
@@ -43,6 +45,9 @@ bot.use(async (ctx, next) => {
 const intelligence = new OnChainPatternRecognition();
 const riskEngine = new CapitalRiskEngine();
 const executor = new LowLatencyExecutionEngine();
+// Every buy and sell routes through the gateway so LIVE and DEMO share one
+// code path -- see src/trading.ts.
+const gateway = new TradeGateway(executor);
 
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const DENGINE_NAME = 'Dengine';
@@ -509,12 +514,18 @@ async function monitorPositions() {
       if (pendingEntries.has(address) && currentMcap >= botSettings.delayedEntryMcap) {
         const pending = pendingEntries.get(address)!;
         pendingEntries.delete(address);
-        if (executor.hasWallet()) {
+        if (executor.hasWallet() || botSettings.tradingMode === 'DEMO') {
           try {
             const tradeSol = botSettings.tradeSizeSol;
-            const tx = await executor.buildJupiterSwapTransaction(address, tradeSol, 'BUY', botSettings.slippageBps);
-            tx.sign([executor.getWalletKeypair()]);
-            const result = await executor.executeSwap(tx);
+            const result = await gateway.buy({
+              address,
+              ticker: pending.ticker,
+              sizeSol: tradeSol,
+              slippageBps: botSettings.slippageBps,
+              price: currentPrice,
+              mode: botSettings.tradingMode,
+              chatId: CHAT_ID,
+            });
             if (result.success && currentPrice > 0) {
               openPositions.set(address, {
                 ticker: pending.ticker, address,
@@ -617,13 +628,20 @@ async function monitorPositions() {
           // ── Actually sell the position on-chain before treating it as
           // closed — this is the fix for the bug where TP/SL only updated
           // tracking and never sold anything for real. ──
-          let sellResult: { success: boolean; signature?: string; error?: string };
+          let sellResult: TradeResult;
           try {
-            const sellTx = await executor.buildJupiterSellTransaction(address, botSettings.slippageBps);
-            sellTx.sign([executor.getWalletKeypair()]);
-            sellResult = await executor.executeSwap(sellTx);
+            sellResult = await gateway.sell({
+              address,
+              ticker: pos.ticker,
+              sizeSol: pos.sizeSol,
+              slippageBps: botSettings.slippageBps,
+              price: currentPrice,
+              entryPrice: pos.entryPrice,
+              mode: botSettings.tradingMode,
+              chatId: CHAT_ID,
+            });
           } catch (e: any) {
-            sellResult = { success: false, error: e.message };
+            sellResult = { success: false, error: e.message, simulated: botSettings.tradingMode === 'DEMO' };
           }
 
           if (!sellResult.success) {
@@ -680,13 +698,20 @@ async function monitorPositions() {
           // closed — same fix as the TP side. This happens regardless of
           // whether the card below gets announced, since the real money
           // needs to be closed either way. ──
-          let sellResult: { success: boolean; signature?: string; error?: string };
+          let sellResult: TradeResult;
           try {
-            const sellTx = await executor.buildJupiterSellTransaction(address, botSettings.slippageBps);
-            sellTx.sign([executor.getWalletKeypair()]);
-            sellResult = await executor.executeSwap(sellTx);
+            sellResult = await gateway.sell({
+              address,
+              ticker: pos.ticker,
+              sizeSol: pos.sizeSol,
+              slippageBps: botSettings.slippageBps,
+              price: currentPrice,
+              entryPrice: pos.entryPrice,
+              mode: botSettings.tradingMode,
+              chatId: CHAT_ID,
+            });
           } catch (e: any) {
-            sellResult = { success: false, error: e.message };
+            sellResult = { success: false, error: e.message, simulated: botSettings.tradingMode === 'DEMO' };
           }
 
           if (!sellResult.success) {
@@ -1057,7 +1082,7 @@ async function scan() {
         let executedSizeSol = 0;
         let executedPrice = 0;
 
-        if (!executor.hasWallet()) {
+        if (!executor.hasWallet() && botSettings.tradingMode !== 'DEMO') {
           executionState = `⚙️ No wallet — use /settings to enable auto\\-buy`;
         } else if (risk.allow) {
           // ── Delayed entry: alert now, but hold the auto-buy until mcap reaches the threshold ──
@@ -1067,14 +1092,26 @@ async function scan() {
           } else {
             try {
               const tradeSol = botSettings.tradeSizeSol;
-              const tx = await executor.buildJupiterSwapTransaction(address, tradeSol, 'BUY', botSettings.slippageBps);
-              tx.sign([executor.getWalletKeypair()]);
-              const result = await executor.executeSwap(tx);
+              const result = await gateway.buy({
+                address,
+                ticker,
+                sizeSol: tradeSol,
+                slippageBps: botSettings.slippageBps,
+                price: currentPrice,
+                mode: botSettings.tradingMode,
+                chatId: CHAT_ID,
+              });
               if (result.success) {
-                const txLink = result.signature ? ` — [Solscan](https://solscan.io/tx/${result.signature})` : '';
-                executionState = `✅ Auto\\-Buy Executed${txLink}`;
+                // A simulated fill has no on-chain tx, so no Solscan link.
+                const txLink = result.simulated
+                  ? ' — 🧪 _simulated_'
+                  : (result.signature ? ` — [Solscan](https://solscan.io/tx/${result.signature})` : '');
+                executionState = result.simulated
+                  ? `🧪 DEMO Buy Executed${txLink}`
+                  : `✅ Auto\\-Buy Executed${txLink}`;
                 executedSizeSol = tradeSol;
-                executedPrice = currentPrice;
+                // Book the slippage-adjusted simulated fill, not the mid price.
+                executedPrice = result.fillPrice ?? currentPrice;
                 if (executedPrice > 0) {
                   openPositions.set(address, {
                     ticker, address,
@@ -1243,6 +1280,93 @@ bot.launch({
 });
 
 bot.command('test', (ctx) => ctx.reply('✅ Bot online. Scanning pump.fun (via WSS) + PumpSwap + Early Detection + Reversals — plus Robinhood Chain (pons launchpad).'));
+// ── Mode switching ─────────────────────────────────────────────────────────────
+// DEMO and LIVE run the identical pipeline; only the fill differs. See
+// src/trading.ts for where the two paths diverge.
+bot.command('mode', async (ctx) => {
+  const parts = ((ctx.message as any)?.text || '').trim().split(/ +/);
+  const arg = (parts[1] || '').toUpperCase();
+
+  if (!arg) {
+    const bal = await getDemoBalance(CHAT_ID);
+    const detail = botSettings.tradingMode === 'DEMO'
+      ? `🧪 Simulated wallet: ${bal.balanceSol.toFixed(4)} SOL (started ${bal.startingBalance} SOL)`
+      : '💰 Real wallet — trades execute on-chain.';
+    return ctx.reply(`⚙️ Trading mode: ${botSettings.tradingMode}
+
+${detail}
+
+Switch with:  /mode live   |   /mode demo`);
+  }
+
+  if (arg !== 'LIVE' && arg !== 'DEMO') {
+    return ctx.reply('Usage: /mode live   or   /mode demo');
+  }
+
+  // Refuse to arm live trading with no wallet, rather than failing later at
+  // the first buy.
+  if (arg === 'LIVE' && !executor.hasWallet()) {
+    return ctx.reply('⚠️ No wallet loaded — set one via /settings before switching to live.');
+  }
+
+  botSettings.tradingMode = arg;
+  await saveSetting(CHAT_ID, 'tradingMode', arg);
+
+  if (arg === 'DEMO') {
+    const bal = await ensureDemoAccount(CHAT_ID);
+    return ctx.reply(`🧪 Switched to DEMO. Simulated balance: ${bal.balanceSol.toFixed(4)} SOL.
+
+Everything runs identically — alerts, entries, TP/SL — but no real SOL moves.`);
+  }
+  return ctx.reply('💰 Switched to LIVE. Trades will now execute on-chain with real funds.');
+});
+
+// ── Demo wallet management ─────────────────────────────────────────────────────
+bot.command('demo', async (ctx) => {
+  const parts = ((ctx.message as any)?.text || '').trim().split(/ +/);
+  const sub = (parts[1] || '').toLowerCase();
+  const amount = parseFloat(parts[2]);
+
+  if (!sub || sub === 'status') {
+    const bal = await getDemoBalance(CHAT_ID);
+    const pnl = bal.balanceSol - bal.startingBalance;
+    const pct = bal.startingBalance > 0 ? (pnl / bal.startingBalance) * 100 : 0;
+    const open = await prisma.activePosition.count({ where: { mode: 'DEMO', status: 'OPEN' } });
+    const closed = await prisma.tradeLog.count({ where: { mode: 'DEMO', status: 'CLOSED' } });
+    const sign = pnl >= 0 ? '+' : '';
+    return ctx.reply(`🧪 Demo Account
+
+Balance: ${bal.balanceSol.toFixed(4)} SOL
+Started: ${bal.startingBalance.toFixed(4)} SOL
+P&L: ${sign}${pnl.toFixed(4)} SOL (${sign}${pct.toFixed(2)}%)
+Open: ${open}   Closed: ${closed}
+
+/demo add 5 | /demo sub 2 | /demo reset [balance]`);
+  }
+
+  if (sub === 'add' || sub === 'sub') {
+    if (!isFinite(amount) || amount <= 0) {
+      return ctx.reply('Usage: /demo add 5   (a positive number of SOL)');
+    }
+    const delta = sub === 'add' ? amount : -amount;
+    const moved = await adjustDemoBalance(CHAT_ID, delta);
+    if (!moved) {
+      const bal = await getDemoBalance(CHAT_ID);
+      return ctx.reply(`❌ That would overdraw the demo wallet. Balance is ${bal.balanceSol.toFixed(4)} SOL.`);
+    }
+    const verb = sub === 'add' ? 'Added' : 'Removed';
+    return ctx.reply(`✅ ${verb} ${amount} SOL. New balance: ${moved.balanceAfter.toFixed(4)} SOL.`);
+  }
+
+  if (sub === 'reset') {
+    const start = isFinite(amount) && amount > 0 ? amount : undefined;
+    const bal = await resetDemoAccount(CHAT_ID, start);
+    return ctx.reply(`♻️ Demo account reset to ${bal.balanceSol.toFixed(4)} SOL. Demo trade history and open demo positions cleared.`);
+  }
+
+  return ctx.reply('Usage: /demo [status | add <sol> | sub <sol> | reset [balance]]');
+});
+
 bot.command('positions', async (ctx) => {
   if (openPositions.size === 0 && pendingEntries.size === 0) return ctx.reply('📭 No open positions.');
   const lines = ['📊 *Open Positions:*', ''];
