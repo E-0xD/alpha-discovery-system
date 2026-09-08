@@ -1,3 +1,26 @@
+# Running and deploying
+
+## Running locally
+
+```bash
+npm install
+npm run setup     # keys, database, migrations, readiness check
+npm run dev       # compile and start
+```
+
+`npm run setup` is idempotent — run it as often as you like. It generates
+`WALLET_ENCRYPTION_KEY` only when blank and never replaces an existing one,
+because that key decrypts the wallet stored in the database.
+
+Telegram only delivers webhooks over public HTTPS, so local runs need a tunnel
+started **before** the bot:
+
+```bash
+ngrok http 10000 --domain=<your-reserved-domain>
+```
+
+---
+
 # Deploying to a VPS with Coolify
 
 ## The one thing that will bite you
