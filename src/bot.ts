@@ -12,6 +12,8 @@ import { TradeGateway, TradeResult } from './trading';
 import { getDemoBalance, ensureDemoAccount, adjustDemoBalance, resetDemoAccount } from './demo';
 import { recordEntry, recordExit, getClosedTrades } from './trades';
 import { renderPnlChart } from './chart';
+import { evaluateTrailing } from './trailing';
+import { savePosition, deletePosition, loadPositions, openExposureSol } from './positions';
 import { helpText, chunk } from './help';
 import { TokenSignal } from './types';
 import { saveEncryptedWallet, loadDecryptedWallet } from './wallet';
@@ -193,10 +195,11 @@ interface Position {
   peakPrice: number;
   sizeSol: number;
   entryTime: number;
-  // ── Dynamic trailing stop loss state ──
-  stopLossLevel: 'initial' | 'breakeven' | 'trailing';
-  stopLossPct: number; // current stop loss % relative to entry (negative = below entry)
-  remainingPct: number; // remaining position size (starts at 100)
+  // Ladder stop as % relative to entry (0 = break even). Null until a rung is
+  // armed, in which case the base stop loss applies. Ratchets upward only.
+  // Replaces stopLossLevel/stopLossPct/remainingPct, which were written on
+  // every position and never read by anything.
+  trailingStopPct: number | null;
 }
 const openPositions = new Map<string, Position>();
 
@@ -589,13 +592,63 @@ async function evaluateOpenPosition(
         const tp = botSettings.takeProfitPct;
         const sl = botSettings.stopLossPct;
 
+        // ── Exit decision ──
+        // FIXED: sell at a hard take-profit, stop out at a hard stop-loss.
+        // TRAILING: no ceiling. The stop ratchets up behind the peak
+        // (+70% -> break even, +100% -> +70%, +150% -> +100%, ...) so winners
+        // are allowed to run and give back only the last rung.
+        const peakProfitPct = ((updated.peakPrice - pos.entryPrice) / pos.entryPrice) * 100;
+        const trailingMode = botSettings.exitMode === 'TRAILING';
+
+        let takeProfitNow = false;
+        let stopOutNow = false;
+        let exitLabel: 'TP' | 'SL' = 'TP';
+
+        if (trailingMode) {
+          const decision = evaluateTrailing({
+            currentProfitPct: pnlPct,
+            peakProfitPct,
+            baseStopLossPct: sl,
+            storedStopPct: pos.trailingStopPct,
+            anticipationPct: TRAIL_ANTICIPATION_PCT,
+          });
+
+          // Persist a ratchet as soon as it arms, so a restart cannot lose a
+          // locked-in stop and hand the position back its full downside.
+          if (decision.laddered && decision.stopPct !== pos.trailingStopPct) {
+            updated.trailingStopPct = decision.stopPct;
+            console.log(
+              `↑ ${pos.ticker} stop ratcheted to ${decision.stopPct >= 0 ? '+' : ''}${decision.stopPct}% (peak +${peakProfitPct.toFixed(0)}%)`
+            );
+          }
+
+          if (decision.shouldExit) {
+            // A laddered exit is booked as a TP when it locks in a gain and an
+            // SL when it does not, so the cards and trade log stay truthful.
+            const lockingGain = decision.stopPct > 0;
+            takeProfitNow = lockingGain;
+            stopOutNow = !lockingGain;
+            exitLabel = lockingGain ? 'TP' : 'SL';
+            console.log(
+              `⚡ ${pos.ticker} ${decision.reason} exit at ${pnlPct.toFixed(1)}% ` +
+              `(stop ${decision.stopPct}%${decision.anticipated ? ', anticipated' : ''})`
+            );
+          }
+        } else {
+          takeProfitNow = pnlPct >= tp;
+          stopOutNow = pnlPct <= -sl;
+        }
+
         // ── TAKE PROFIT ──
-        if (pnlPct >= tp) {
+        if (takeProfitNow) {
           const pnlSol = pos.sizeSol * (pnlPct / 100);
 
           // ── Actually sell the position on-chain before treating it as
           // closed — this is the fix for the bug where TP/SL only updated
           // tracking and never sold anything for real. ──
+          // Respect the backoff so a rugged position cannot spin the loop.
+          if (!canAttemptSell(address)) return;
+
           let sellResult: TradeResult;
           try {
             sellResult = await gateway.sell({
@@ -613,9 +666,10 @@ async function evaluateOpenPosition(
           }
 
           if (!sellResult.success) {
-            console.log(`❌ TP sell failed for ${pos.ticker}, keeping position open to retry next cycle: ${sellResult.error}`);
+            noteSellFailure(address, pos.ticker, sellResult.error);
             return;
           }
+          noteSellSuccess(address);
 
           const solUsd = await getSolUsd();
           const rec = alertHistory.get(address);
@@ -663,12 +717,13 @@ async function evaluateOpenPosition(
             peakPrice: pos.peakPrice,
           });
           openPositions.delete(address);
+          await deletePosition(botSettings.tradingMode, address);
           console.log(`✅ TP hit + sold: ${pos.ticker} +${pnlPct.toFixed(1)}% — tx: ${sellResult.signature}`);
           return;
         }
 
         // ── STOP LOSS ──
-        if (pnlPct <= -sl) {
+        if (stopOutNow) {
           const pnlSol = pos.sizeSol * (pnlPct / 100);
           const peakGainPct = ((pos.peakPrice - pos.entryPrice) / pos.entryPrice) * 100;
           const everPumped = peakGainPct >= 40;
@@ -677,6 +732,9 @@ async function evaluateOpenPosition(
           // closed — same fix as the TP side. This happens regardless of
           // whether the card below gets announced, since the real money
           // needs to be closed either way. ──
+          // Respect the backoff so a rugged position cannot spin the loop.
+          if (!canAttemptSell(address)) return;
+
           let sellResult: TradeResult;
           try {
             sellResult = await gateway.sell({
@@ -694,9 +752,10 @@ async function evaluateOpenPosition(
           }
 
           if (!sellResult.success) {
-            console.log(`❌ SL sell failed for ${pos.ticker}, keeping position open to retry next cycle: ${sellResult.error}`);
+            noteSellFailure(address, pos.ticker, sellResult.error);
             return;
           }
+          noteSellSuccess(address);
 
           const rec = alertHistory.get(address);
 
@@ -723,6 +782,7 @@ async function evaluateOpenPosition(
             peakPrice: pos.peakPrice,
           });
           openPositions.delete(address);
+          await deletePosition(botSettings.tradingMode, address);
 
           // ── Only announce stop-loss for tokens that never gained real traction.
           // A token that pumped 40%+ first already got milestone cards —
@@ -758,6 +818,14 @@ async function evaluateOpenPosition(
         }
 
         openPositions.set(address, updated);
+        // Persist peak and any ratchet so a restart resumes with the stop
+        // already locked in rather than handing back full downside.
+        if (
+          updated.peakPrice !== pos.peakPrice ||
+          updated.trailingStopPct !== pos.trailingStopPct
+        ) {
+          await savePosition(botSettings.tradingMode, updated);
+        }
       }
 }
 
@@ -768,6 +836,77 @@ async function evaluateOpenPosition(
 // it is how long a position can sit un-checked after a price move. Sub-second
 // values are allowed but hit upstream rate limits with several open
 // positions -- 1s is the sweet spot.
+// How far above the stop an exit fires early. The risk loop samples about once
+// a second and price can gap straight through a level between samples, so you
+// intend to exit at +70% and actually fill at +58%. Firing inside a narrow band
+// lands the realised exit much closer to the intended number. Too wide and
+// ordinary noise closes winners early, which costs more than it saves.
+const TRAIL_ANTICIPATION_PCT = Number(process.env.TRAIL_ANTICIPATION_PCT || '2');
+
+// ── Failed-sell backoff ───────────────────────────────────────────────────────
+// A failed sell keeps the position open and retries on the next cycle. That was
+// tolerable on a 30s loop; on a 1s loop a rugged token with no liquidity would
+// retry every second forever — thousands of Jupiter quotes an hour, which
+// rate-limits the price feed and degrades stop-loss timing for the HEALTHY
+// positions. Retries now back off exponentially and eventually give up.
+const SELL_BACKOFF_BASE_MS = Number(process.env.SELL_BACKOFF_BASE_MS || '5000');
+const SELL_BACKOFF_MAX_MS = Number(process.env.SELL_BACKOFF_MAX_MS || '300000'); // 5 min
+const SELL_MAX_ATTEMPTS = Number(process.env.SELL_MAX_ATTEMPTS || '25');
+
+const sellBackoff = new Map<string, { failures: number; nextAttemptAt: number }>();
+
+/**
+ * Portfolio exposure cap.
+ *
+ * MAX_PORTFOLIO_EXPOSURE_SOL existed in risk.ts and was never referenced, so
+ * there was no ceiling on how much capital could be deployed at once -- the bot
+ * would happily open unlimited concurrent positions. Now enforced against the
+ * durable position table, per mode.
+ */
+async function exposureAllows(sizeSol: number): Promise<{ ok: boolean; reason?: string }> {
+  const cap = botSettings.maxPortfolioSol;
+  if (!cap || cap <= 0) return { ok: true };
+  const current = await openExposureSol(botSettings.tradingMode);
+  if (current + sizeSol > cap) {
+    return {
+      ok: false,
+      reason: `exposure cap reached: ${current.toFixed(3)} + ${sizeSol} > ${cap} SOL`,
+    };
+  }
+  return { ok: true };
+}
+
+function canAttemptSell(address: string): boolean {
+  const b = sellBackoff.get(address);
+  if (!b) return true;
+  if (b.failures >= SELL_MAX_ATTEMPTS) return false;
+  return Date.now() >= b.nextAttemptAt;
+}
+
+function noteSellFailure(address: string, ticker: string, error?: string): void {
+  const b = sellBackoff.get(address) || { failures: 0, nextAttemptAt: 0 };
+  b.failures += 1;
+  const delay = Math.min(SELL_BACKOFF_BASE_MS * 2 ** (b.failures - 1), SELL_BACKOFF_MAX_MS);
+  b.nextAttemptAt = Date.now() + delay;
+  sellBackoff.set(address, b);
+
+  if (b.failures >= SELL_MAX_ATTEMPTS) {
+    console.log(
+      `⛔ ${ticker}: giving up after ${b.failures} failed sells — position left open ` +
+      `and no longer retried. Likely rugged or no liquidity. Sell manually if it recovers.`
+    );
+  } else {
+    console.log(
+      `⏳ ${ticker}: sell failed (${b.failures}/${SELL_MAX_ATTEMPTS}), next retry in ` +
+      `${Math.round(delay / 1000)}s: ${error || 'unknown'}`
+    );
+  }
+}
+
+function noteSellSuccess(address: string): void {
+  sellBackoff.delete(address);
+}
+
 const RISK_LOOP_MS = Number(process.env.RISK_LOOP_MS || '1000');
 const MONITOR_LOOP_MS = Number(process.env.MONITOR_LOOP_MS || '30000');
 
@@ -830,6 +969,13 @@ async function monitorPositions() {
         if (executor.hasWallet() || botSettings.tradingMode === 'DEMO') {
           try {
             const tradeSol = botSettings.tradeSizeSol;
+
+            const room = await exposureAllows(tradeSol);
+            if (!room.ok) {
+              console.log(`⛔ Delayed entry for ${pending.ticker} skipped: ${room.reason}`);
+              return;
+            }
+
             const result = await gateway.buy({
               address,
               ticker: pending.ticker,
@@ -846,10 +992,9 @@ async function monitorPositions() {
                 peakPrice: currentPrice,
                 sizeSol: tradeSol,
                 entryTime: now,
-                stopLossLevel: 'initial',
-                stopLossPct: -35,
-                remainingPct: 100,
+                trailingStopPct: null,
               });
+              await savePosition(botSettings.tradingMode, openPositions.get(address)!);
               await recordEntry({
                 address,
                 ticker: pending.ticker,
@@ -1252,7 +1397,17 @@ async function scan() {
             executionState = `⏳ Delayed Entry Armed — waiting for $${botSettings.delayedEntryMcap.toLocaleString('en-US')} MCAP \\(currently $${mcap.toLocaleString('en-US', { maximumFractionDigits: 0 })}\\)`;
           } else {
             try {
-              const tradeSol = botSettings.tradeSizeSol;
+              // Conviction sizing: A+ setups get a multiple of the configured
+              // size (see risk.ts), rather than a flat amount.
+              const tradeSol = botSettings.tradeSizeSol * (risk.sizeMultiplier ?? 1);
+
+              const room = await exposureAllows(tradeSol);
+              if (!room.ok) {
+                executionState = `⛔ Skipped \- ${escapeText(room.reason || 'exposure cap')}`;
+                console.log(`⛔ ${ticker}: ${room.reason}`);
+                throw new Error('EXPOSURE_CAP');
+              }
+
               const result = await gateway.buy({
                 address,
                 ticker,
@@ -1280,10 +1435,9 @@ async function scan() {
                     peakPrice: executedPrice,
                     sizeSol: executedSizeSol,
                     entryTime: Date.now(),
-                    stopLossLevel: 'initial',
-                    stopLossPct: -35,
-                    remainingPct: 100,
+                    trailingStopPct: null,
                   });
+                  await savePosition(botSettings.tradingMode, openPositions.get(address)!);
                   await recordEntry({
                     address,
                     ticker: ticker,
@@ -1297,11 +1451,17 @@ async function scan() {
                 executionState = `❌ Auto\\-Buy Failed: ${escapeText(result.error || '')}`;
               }
             } catch (execErr: any) {
+              // The exposure cap unwinds via throw to skip the buy; it already
+              // set an accurate executionState, so don't relabel it as an error.
+              if (execErr.message === 'EXPOSURE_CAP') {
+                // executionState is already set by the cap check.
+              } else {
               console.log("🔥 AUTO-BUY REJECTION REASON:", JSON.stringify(execErr.response?.data || execErr.message));
               const isNetworkErr = execErr.message?.includes('ENOTFOUND') || execErr.message?.includes('ECONNREFUSED');
               executionState = isNetworkErr
                 ? `⏸ Execution Paused: Jupiter unreachable on free tier`
                 : `❌ Execution Blocked: ${escapeText(execErr.message)}`;
+              }
             }
           }
         } else {
@@ -1413,6 +1573,36 @@ async function init() {
   }
 
   await loadHistory();
+
+  // Restore open positions so a restart does not abandon live trades.
+  // Without this every redeploy silently orphaned every open position: the
+  // tokens stayed in the wallet, the bot forgot them, and no stop-loss or
+  // take-profit could ever fire for them again.
+  try {
+    const restored = await loadPositions(botSettings.tradingMode);
+    for (const p of restored) {
+      openPositions.set(p.address, {
+        ticker: p.ticker,
+        address: p.address,
+        entryPrice: p.entryPrice,
+        peakPrice: p.peakPrice,
+        sizeSol: p.sizeSol,
+        entryTime: p.entryTime,
+        trailingStopPct: p.trailingStopPct,
+      });
+    }
+    if (restored.length) {
+      const exposure = restored.reduce((a, p) => a + p.sizeSol, 0);
+      console.log(
+        `♻️ Restored ${restored.length} open ${botSettings.tradingMode} position(s), ` +
+        `${exposure.toFixed(3)} SOL exposure: ${restored.map((p) => p.ticker).join(', ')}`
+      );
+    } else {
+      console.log('No open positions to restore.');
+    }
+  } catch (e: any) {
+    console.log(`⚠️ Position restore failed: ${e.message}`);
+  }
 }
 
 // In polling mode Telegraf starts no HTTP server, but the container
@@ -1582,6 +1772,48 @@ bot.command('help', async (ctx) => {
   for (const part of chunk(helpText(botSettings))) {
     await ctx.reply(part);
   }
+});
+
+// ── Exit strategy ─────────────────────────────────────────────────────────────
+bot.command('exitmode', async (ctx) => {
+  const parts = ((ctx.message as any)?.text || '').trim().split(/ +/);
+  const arg = (parts[1] || '').toLowerCase();
+
+  if (!arg) {
+    const current = botSettings.exitMode;
+    return ctx.reply(`Exit strategy: ${current}
+
+FIXED — sells at +${botSettings.takeProfitPct}%, stops out at -${botSettings.stopLossPct}%.
+Every winner is capped at the same number.
+
+TRAILING — no ceiling. The stop climbs behind the peak:
+  reaches +70%   stop moves to break even
+  reaches +100%  stop moves to +70%
+  reaches +150%  stop moves to +100%
+  reaches +200%  stop moves to +150%
+  ...and onward in 50% steps
+
+The stop only ever moves up, and follows the highest price reached — not
+the current one. Below +70% your normal -${botSettings.stopLossPct}% stop loss applies.
+
+Switch with:  /exitmode fixed   |   /exitmode trailing`);
+  }
+
+  if (arg !== 'fixed' && arg !== 'trailing') {
+    return ctx.reply('Usage: /exitmode fixed   or   /exitmode trailing');
+  }
+
+  const next = arg === 'trailing' ? 'TRAILING' : 'FIXED';
+  botSettings.exitMode = next;
+  await saveSetting(CHAT_ID, 'exitMode', next);
+
+  return ctx.reply(
+    next === 'TRAILING'
+      ? `Switched to TRAILING. Winners now run until they give back the last step.
+
+Applies to positions already open too — their stop is worked out from the highest price reached so far.`
+      : `Switched to FIXED. Positions now sell at +${botSettings.takeProfitPct}% and stop out at -${botSettings.stopLossPct}%.`
+  );
 });
 
 // ── P&L chart ─────────────────────────────────────────────────────────────────

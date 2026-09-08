@@ -47,6 +47,7 @@ export function helpText(s: BotSettings): string {
     '/chart       your profit and loss, as a graph',
     '/positions   what you are holding right now',
     '/settings    change trade size, take profit, stop loss',
+    '/exitmode    fixed take profit, or a trailing stop',
     '/mode        switch between practice and real money',
     '/demo        your practice balance (add, remove, reset)',
     '/pnl         how well the alerts have been doing',
@@ -59,8 +60,16 @@ export function helpText(s: BotSettings): string {
     'YOUR SETTINGS RIGHT NOW',
     '',
     'Trade size      ' + s.tradeSizeSol + ' SOL on each buy',
-    'Take profit     sells when up ' + s.takeProfitPct + '%',
-    'Stop loss       sells when down ' + s.stopLossPct + '%',
+    'Exit strategy   ' + (s.exitMode === 'TRAILING'
+      ? 'trailing stop — winners run, stop climbs behind'
+      : 'fixed — sells at a set percentage'),
+    ...(s.exitMode === 'TRAILING'
+      ? ['Stop loss       ' + s.stopLossPct + '% until the trail kicks in at +70%']
+      : [
+          'Take profit     sells when up ' + s.takeProfitPct + '%',
+          'Stop loss       sells when down ' + s.stopLossPct + '%',
+        ]),
+    'Max at risk     ' + s.maxPortfolioSol + ' SOL across all open trades',
     'Slippage        ' + s.slippageBps / 100 + '% price movement allowed',
     'Delayed entry   ' + (s.delayedEntryEnabled
       ? 'on — waits for $' + s.delayedEntryMcap.toLocaleString('en-US')

@@ -61,6 +61,10 @@ model ActivePosition {
   status          String  @default("OPEN")
   highestPriceUsd Float?  @map("highest_price_usd")
   timestamp       Float?
+  /// Trailing stop level as a percentage relative to entry (0 = break even,
+  /// 70 = lock in +70%). Null means no rung reached yet, so the base stop
+  /// loss applies. Ratchets upward only.
+  trailingStopPct Float?  @map("trailing_stop_pct")
 
   // Composite key: the same token can be held simultaneously in live and
   // demo without the two clobbering each other.
@@ -151,6 +155,11 @@ model BotSetting {
   /// "LIVE" or "DEMO". Demo runs the identical code path but simulates the
   /// fill instead of signing and broadcasting a real swap.
   tradingMode         String   @default("LIVE") @map("trading_mode")
+  /// "FIXED" sells at takeProfitPct. "TRAILING" lets winners run and exits on
+  /// a ratcheting stop instead.
+  exitMode            String   @default("FIXED") @map("exit_mode")
+  /// Hard cap on total SOL deployed across all open positions.
+  maxPortfolioSol     Float    @default(5.0) @map("max_portfolio_sol")
   updatedAt           DateTime @updatedAt @map("updated_at")
 
   @@map("bot_settings")

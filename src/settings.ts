@@ -1,6 +1,9 @@
 import { prisma } from './db';
 
 export type TradingMode = 'LIVE' | 'DEMO';
+/** FIXED sells at takeProfitPct. TRAILING lets winners run behind a
+ *  ratcheting stop instead of capping them. */
+export type ExitMode = 'FIXED' | 'TRAILING';
 
 export interface BotSettings {
   tradeSizeSol: number;
@@ -11,6 +14,8 @@ export interface BotSettings {
   robinhoodEnabled: boolean;
   slippageBps: number;
   tradingMode: TradingMode;
+  exitMode: ExitMode;
+  maxPortfolioSol: number;
 }
 
 export const DEFAULT_SETTINGS: BotSettings = {
@@ -24,6 +29,9 @@ export const DEFAULT_SETTINGS: BotSettings = {
   // Deliberately defaults to DEMO. A fresh install (or a wiped volume) must
   // never start firing real buys before the operator has explicitly opted in.
   tradingMode: 'DEMO',
+  // Defaults to the existing behaviour; switch with /exitmode.
+  exitMode: 'FIXED',
+  maxPortfolioSol: 5.0,
 };
 
 export async function saveSetting(
@@ -51,6 +59,8 @@ export async function loadSettings(chatId: string): Promise<BotSettings> {
       robinhoodEnabled: r.robinhoodEnabled ?? DEFAULT_SETTINGS.robinhoodEnabled,
       slippageBps: Number(r.slippageBps) || DEFAULT_SETTINGS.slippageBps,
       tradingMode: r.tradingMode === 'LIVE' ? 'LIVE' : 'DEMO',
+      exitMode: r.exitMode === 'TRAILING' ? 'TRAILING' : 'FIXED',
+      maxPortfolioSol: Number(r.maxPortfolioSol) || DEFAULT_SETTINGS.maxPortfolioSol,
     };
   } catch {
     return { ...DEFAULT_SETTINGS };
