@@ -44,8 +44,21 @@ const STEP_PCT = 50;
  * (the position is still under the first threshold, so the base stop loss
  * applies instead).
  */
-export function ladderStopFor(peakProfitPct: number, ladder: LadderRung[] = DEFAULT_LADDER): number | null {
+export function ladderStopFor(
+  peakProfitPct: number,
+  ladder: LadderRung[] = DEFAULT_LADDER,
+  maxProfitPct?: number
+): number | null {
   if (!ladder.length) return null;
+
+  // The ladder climbs only up to the configured ceiling (default 5x = +400%).
+  // Clamping the PEAK used for rung lookup, rather than clamping the resulting
+  // stop, keeps every armed rung at its documented level -- clamping the stop
+  // would produce levels that appear nowhere in the ladder (a 2x ceiling would
+  // turn the +100% rung's "+70%" into "+50%").
+  const effectivePeak =
+    typeof maxProfitPct === 'number' ? Math.min(peakProfitPct, maxProfitPct) : peakProfitPct;
+  peakProfitPct = effectivePeak;
 
   const last = ladder[ladder.length - 1];
 
@@ -99,10 +112,12 @@ export function evaluateTrailing(opts: {
   storedStopPct?: number | null;
   anticipationPct?: number;
   ladder?: LadderRung[];
+  /** Ceiling the ladder climbs to, as profit %. 400 = 5x. */
+  maxProfitPct?: number;
 }): TrailingDecision {
   const anticipation = opts.anticipationPct ?? 2;
 
-  const fromLadder = ladderStopFor(opts.peakProfitPct, opts.ladder);
+  const fromLadder = ladderStopFor(opts.peakProfitPct, opts.ladder, opts.maxProfitPct);
 
   // Ratchet: never below what is already locked in.
   let laddered = false;
@@ -128,4 +143,9 @@ export function evaluateTrailing(opts: {
     reason: breached || withinBand ? (laddered ? 'TRAIL' : 'SL') : 'NONE',
     anticipated: withinBand,
   };
+}
+
+/** Convert a target multiple (5 = 5x) into the profit percentage it represents. */
+export function multipleToProfitPct(multiple: number): number {
+  return (multiple - 1) * 100;
 }

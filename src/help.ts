@@ -46,8 +46,7 @@ export function helpText(s: BotSettings): string {
     '',
     '/chart       your profit and loss, as a graph',
     '/positions   what you are holding right now',
-    '/settings    change trade size, take profit, stop loss',
-    '/exitmode    fixed take profit, or a trailing stop',
+    '/settings    trade size, take profit, stop loss, exit strategy',
     '/mode        switch between practice and real money',
     '/demo        your practice balance (add, remove, reset)',
     '/pnl         how well the alerts have been doing',
@@ -61,7 +60,7 @@ export function helpText(s: BotSettings): string {
     '',
     'Trade size      ' + s.tradeSizeSol + ' SOL on each buy',
     'Exit strategy   ' + (s.exitMode === 'TRAILING'
-      ? 'trailing stop — winners run, stop climbs behind'
+      ? 'trailing stop, climbing to ' + s.trailingMaxX + 'x'
       : 'fixed — sells at a set percentage'),
     ...(s.exitMode === 'TRAILING'
       ? ['Stop loss       ' + s.stopLossPct + '% until the trail kicks in at +70%']

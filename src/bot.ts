@@ -12,7 +12,7 @@ import { TradeGateway, TradeResult } from './trading';
 import { getDemoBalance, ensureDemoAccount, adjustDemoBalance, resetDemoAccount } from './demo';
 import { recordEntry, recordExit, getClosedTrades } from './trades';
 import { renderPnlChart } from './chart';
-import { evaluateTrailing } from './trailing';
+import { evaluateTrailing, multipleToProfitPct } from './trailing';
 import { savePosition, deletePosition, loadPositions, openExposureSol } from './positions';
 import { helpText, chunk } from './help';
 import { TokenSignal } from './types';
@@ -149,7 +149,7 @@ if (BOT_MODE === 'webhook' && !DOMAIN) {
 const seenTokens = new Set<string>();
 const seenTokensQueue: string[] = [];
 const wssPumpTokensQueue: any[] = [];
-type AwaitingType = 'privateKey' | 'tradeSize' | 'tp' | 'sl' | 'delayedEntryMcap' | 'slippage';
+type AwaitingType = 'privateKey' | 'tradeSize' | 'tp' | 'sl' | 'delayedEntryMcap' | 'slippage' | 'trailingMax';
 const awaitingInput = new Map<string, AwaitingType>();
 const awaitingTimers = new Map<string, NodeJS.Timeout>();
 const AWAITING_TIMEOUT_MS = 5 * 60 * 1000;
@@ -611,6 +611,7 @@ async function evaluateOpenPosition(
             baseStopLossPct: sl,
             storedStopPct: pos.trailingStopPct,
             anticipationPct: TRAIL_ANTICIPATION_PCT,
+            maxProfitPct: multipleToProfitPct(botSettings.trailingMaxX),
           });
 
           // Persist a ratchet as soon as it arms, so a restart cannot lose a
@@ -1774,48 +1775,6 @@ bot.command('help', async (ctx) => {
   }
 });
 
-// ── Exit strategy ─────────────────────────────────────────────────────────────
-bot.command('exitmode', async (ctx) => {
-  const parts = ((ctx.message as any)?.text || '').trim().split(/ +/);
-  const arg = (parts[1] || '').toLowerCase();
-
-  if (!arg) {
-    const current = botSettings.exitMode;
-    return ctx.reply(`Exit strategy: ${current}
-
-FIXED — sells at +${botSettings.takeProfitPct}%, stops out at -${botSettings.stopLossPct}%.
-Every winner is capped at the same number.
-
-TRAILING — no ceiling. The stop climbs behind the peak:
-  reaches +70%   stop moves to break even
-  reaches +100%  stop moves to +70%
-  reaches +150%  stop moves to +100%
-  reaches +200%  stop moves to +150%
-  ...and onward in 50% steps
-
-The stop only ever moves up, and follows the highest price reached — not
-the current one. Below +70% your normal -${botSettings.stopLossPct}% stop loss applies.
-
-Switch with:  /exitmode fixed   |   /exitmode trailing`);
-  }
-
-  if (arg !== 'fixed' && arg !== 'trailing') {
-    return ctx.reply('Usage: /exitmode fixed   or   /exitmode trailing');
-  }
-
-  const next = arg === 'trailing' ? 'TRAILING' : 'FIXED';
-  botSettings.exitMode = next;
-  await saveSetting(CHAT_ID, 'exitMode', next);
-
-  return ctx.reply(
-    next === 'TRAILING'
-      ? `Switched to TRAILING. Winners now run until they give back the last step.
-
-Applies to positions already open too — their stop is worked out from the highest price reached so far.`
-      : `Switched to FIXED. Positions now sell at +${botSettings.takeProfitPct}% and stop out at -${botSettings.stopLossPct}%.`
-  );
-});
-
 // ── P&L chart ─────────────────────────────────────────────────────────────────
 // Always follows the CURRENT trading mode: in demo you get the demo curve, in
 // live the live one. The two never mix, because trades_log rows are tagged by
@@ -2220,8 +2179,15 @@ async function buildSettingsMessage() {
     walletLine,
     `💵 *Balance:* ${balanceDisplay}`,
     `💰 *Trade Size:* ${botSettings.tradeSizeSol} SOL per trade`,
-    `🎯 *Take Profit:* +${botSettings.takeProfitPct}%`,
+    botSettings.exitMode === 'TRAILING'
+      ? `🔁 *Exit:* Trailing stop, ladder climbs to ${botSettings.trailingMaxX}x`
+      : `🔁 *Exit:* Fixed take profit`,
+    ...(botSettings.exitMode === 'TRAILING'
+      ? [`🛑 *Stop Loss:* \\-${botSettings.stopLossPct}% until the trail arms at +70%`,]
+      : [
+        `🎯 *Take Profit:* +${botSettings.takeProfitPct}%`,
     `🛑 *Stop Loss:* \\-${botSettings.stopLossPct}%`,
+        ]),
     `⏳ *Delayed Entry:* ${botSettings.delayedEntryEnabled ? '✅ ON' : '❌ OFF'} — buy held until $${botSettings.delayedEntryMcap.toLocaleString('en-US')} MCAP`,
     `🪙 *Robinhood:* ${botSettings.robinhoodEnabled ? '✅ ON' : '❌ OFF'} — launchpad scans and listeners are ${botSettings.robinhoodEnabled ? 'active' : 'disabled'}`,
     `📉 *Slippage Tolerance:* ${(botSettings.slippageBps / 100).toFixed(1)}% — tighter reduces sandwich exposure, wider reduces failed trades`,
@@ -2233,6 +2199,15 @@ async function buildSettingsMessage() {
     [Markup.button.callback('🎯 Set Take Profit %', 'set_tp')],
     [Markup.button.callback('🛑 Set Stop Loss %', 'set_sl')],
     [Markup.button.callback('📉 Set Slippage %', 'set_slippage')],
+    [Markup.button.callback(
+      botSettings.exitMode === 'TRAILING'
+        ? '🔁 Exit: TRAILING stop (tap for fixed TP)'
+        : '🔁 Exit: FIXED take profit (tap for trailing)',
+      'toggle_exit_mode'
+    )],
+    ...(botSettings.exitMode === 'TRAILING'
+      ? [[Markup.button.callback(`📈 Trailing ladder max: ${botSettings.trailingMaxX}x`, 'set_trailing_max')]]
+      : []),
     [Markup.button.callback(
       botSettings.delayedEntryEnabled ? '⏳ Delayed Entry: ON (tap to disable)' : '⏳ Delayed Entry: OFF (tap to enable)',
       'toggle_delayed_entry'
@@ -2270,6 +2245,28 @@ bot.action('toggle_delayed_entry', async (ctx) => {
   await saveSetting(ctx.chat!.id.toString(), 'delayedEntryEnabled', botSettings.delayedEntryEnabled);
   const { text, keyboard } = await buildSettingsMessage();
   await ctx.editMessageText(text, { parse_mode: 'Markdown', ...keyboard });
+});
+
+bot.action('toggle_exit_mode', async (ctx) => {
+  await ctx.answerCbQuery();
+  botSettings.exitMode = botSettings.exitMode === 'TRAILING' ? 'FIXED' : 'TRAILING';
+  await saveSetting(ctx.chat!.id.toString(), 'exitMode', botSettings.exitMode);
+  const { text, keyboard } = await buildSettingsMessage();
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...keyboard });
+});
+
+bot.action('set_trailing_max', async (ctx) => {
+  await ctx.answerCbQuery();
+  setAwaiting(ctx.chat!.id.toString(), 'trailingMax');
+  await ctx.reply(
+    `📈 *How far should the trailing ladder climb?*
+
+Enter a multiple. 5 means the stop keeps ratcheting up until the token
+reaches 5x, then holds its last step.
+
+Current: *${botSettings.trailingMaxX}x*`,
+    { parse_mode: 'Markdown' }
+  );
 });
 
 bot.action('toggle_robinhood', async (ctx) => {
@@ -2400,6 +2397,19 @@ bot.on('text', async (ctx) => {
     botSettings.delayedEntryMcap = value;
     await saveSetting(chatId, 'delayedEntryMcap', value);
     await ctx.reply(`✅ *Delayed entry MCAP set to $${value.toLocaleString('en-US')}*`, { parse_mode: 'Markdown' });
+  } else if (waiting === 'trailingMax') {
+    // Below 2x is meaningless: the first rung does not arm until +70%.
+    if (value < 2) {
+      await ctx.reply('❌ Must be at least 2x — the ladder does not arm until +70%.');
+      return;
+    }
+    if (value > 100) {
+      await ctx.reply('❌ Capped at 100x.');
+      return;
+    }
+    botSettings.trailingMaxX = value;
+    await saveSetting(chatId, 'trailingMaxX', value);
+    await ctx.reply(`✅ *Trailing ladder now climbs to ${value}x*`, { parse_mode: 'Markdown' });
   } else if (waiting === 'slippage') {
     if (value > 50) {
       await ctx.reply(`❌ Slippage capped at 50% for safety\\.`, { parse_mode: 'Markdown' });

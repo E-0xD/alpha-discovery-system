@@ -160,6 +160,9 @@ model BotSetting {
   exitMode            String   @default("FIXED") @map("exit_mode")
   /// Hard cap on total SOL deployed across all open positions.
   maxPortfolioSol     Float    @default(5.0) @map("max_portfolio_sol")
+  /// How far the trailing ladder climbs, as a multiple of entry. 5 = 5x
+  /// (+400%). Past this the stop stops ratcheting and holds its last rung.
+  trailingMaxX        Float    @default(5.0) @map("trailing_max_x")
   updatedAt           DateTime @updatedAt @map("updated_at")
 
   @@map("bot_settings")

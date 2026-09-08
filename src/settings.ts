@@ -16,6 +16,8 @@ export interface BotSettings {
   tradingMode: TradingMode;
   exitMode: ExitMode;
   maxPortfolioSol: number;
+  /** Ladder ceiling as a multiple of entry. 5 = 5x. */
+  trailingMaxX: number;
 }
 
 export const DEFAULT_SETTINGS: BotSettings = {
@@ -32,6 +34,7 @@ export const DEFAULT_SETTINGS: BotSettings = {
   // Defaults to the existing behaviour; switch with /exitmode.
   exitMode: 'FIXED',
   maxPortfolioSol: 5.0,
+  trailingMaxX: 5,
 };
 
 export async function saveSetting(
@@ -61,6 +64,7 @@ export async function loadSettings(chatId: string): Promise<BotSettings> {
       tradingMode: r.tradingMode === 'LIVE' ? 'LIVE' : 'DEMO',
       exitMode: r.exitMode === 'TRAILING' ? 'TRAILING' : 'FIXED',
       maxPortfolioSol: Number(r.maxPortfolioSol) || DEFAULT_SETTINGS.maxPortfolioSol,
+      trailingMaxX: Number(r.trailingMaxX) || DEFAULT_SETTINGS.trailingMaxX,
     };
   } catch {
     return { ...DEFAULT_SETTINGS };
