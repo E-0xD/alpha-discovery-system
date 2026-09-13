@@ -53,6 +53,7 @@ export function helpText(s: BotSettings): string {
     '/winrate     how often the alerts are right',
     '/report      download your history as a spreadsheet',
     '/test        check the bot is awake',
+    '/status      database health, and whether data is safe',
     '/cancel      stop the bot waiting for an answer',
     '/help        this message',
     '',

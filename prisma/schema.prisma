@@ -197,3 +197,17 @@ model DemoLedger {
   @@index([chatId, timestamp])
   @@map("demo_ledger")
 }
+
+/// Small key/value store for operational facts about this install.
+///
+/// Chiefly: proving the SQLite volume actually persists. A boot counter and a
+/// first-seen timestamp answer that definitively -- if the count resets to 1
+/// on every deploy, the database is being recreated and the volume is not
+/// mounted where DATABASE_URL points.
+model AppState {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("app_state")
+}

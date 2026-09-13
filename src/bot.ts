@@ -23,6 +23,7 @@ import {
   loadPendingEntries,
 } from './positions';
 import { helpText, chunk } from './help';
+import { recordBoot, getDbHealth, formatDbHealth } from './health';
 import { TokenSignal } from './types';
 import { saveEncryptedWallet, loadDecryptedWallet } from './wallet';
 import { saveSetting, loadSettings, BotSettings, DEFAULT_SETTINGS } from './settings';
@@ -1562,6 +1563,22 @@ async function scan() {
 async function init() {
   await initDatabaseSchema();
 
+  // Boot counter is what proves the volume actually persists across
+  // deploys. See src/health.ts.
+  try {
+    const boot = await recordBoot();
+    if (boot.isFirstBoot) {
+      console.log('\U0001f195 First boot against this database - persistence unproven until the next restart.');
+    } else {
+      console.log(
+        `\u2705 Database persisted - boot #${boot.bootCount}, first seen ` +
+          new Date(boot.firstBootAt).toISOString()
+      );
+    }
+  } catch (e: any) {
+    console.log(`\u26a0\ufe0f Could not record boot: ${e.message}`);
+  }
+
   // Schema (alert_history included) is owned by Prisma migrations, applied by
   // `prisma migrate deploy` on container start — no runtime DDL any more.
 
@@ -1791,6 +1808,17 @@ Open: ${open}   Closed: ${closed}
 // Sent as plain text on purpose: setting names and env vars are full of
 // underscores, and Telegram's Markdown parser reads those as italics markers —
 // one unbalanced underscore fails the whole send with a 400.
+bot.command('status', async (ctx) => {
+  try {
+    const h = await getDbHealth();
+    for (const part of chunk(formatDbHealth(h))) {
+      await ctx.reply(part);
+    }
+  } catch (e: any) {
+    await ctx.reply('Could not read database status: ' + e.message);
+  }
+});
+
 bot.command('help', async (ctx) => {
   for (const part of chunk(helpText(botSettings))) {
     await ctx.reply(part);
