@@ -96,12 +96,51 @@ RPC (`QUICKNODE_RPC_URL` or `HELIUS_API_KEY`). Demo mode needs none of these.
 Leave `REDIS_URL` blank — it is only a cache now, and the bot logs that it is
 running on SQLite alone.
 
-## 5. Deploy
+## 5. Post-deployment command (required)
 
-Migrations apply automatically on start (`prisma migrate deploy`, which only
-applies committed migrations and never resets data).
+Coolify → your app → **Configuration → Post-deployment Command**:
 
-A healthy first boot logs roughly:
+```
+npx prisma migrate deploy
+```
+
+**Why it is not in the container's startup.** SQLite allows exactly one writer.
+Running `migrate deploy` as the container starts races the *old* container,
+which is still running during a rolling deploy, and fails with
+`database is locked`. The new container then exits, never opens its port,
+never goes healthy — so the orchestrator never stops the old one. Deadlock,
+retrying forever.
+
+The post-deployment hook runs after the changeover, when nothing else holds the
+file.
+
+### Also: turn OFF rolling updates
+
+Coolify → **Configuration → Advanced → Rolling Update / zero-downtime** — turn
+it off. Two containers must never run against the same SQLite file, even
+briefly. Expect a few seconds of downtime per deploy; that is correct for a
+single-writer database.
+
+### First deploy only
+
+On a brand-new volume the database has no tables yet, so the bot will crash-loop
+until migrations have run once. That is expected and self-corrects the moment
+the post-deployment command completes. To avoid it entirely, run the migration
+by hand before the first start:
+
+```bash
+docker exec <container> npx prisma migrate deploy
+```
+
+Later deploys are unaffected — existing tables keep working while new
+migrations are pending.
+
+## 6. Deploy
+
+`migrate deploy` applies committed migrations only. It never prompts and never
+resets data, which is what makes it safe to run on every deploy.
+
+A healthy boot logs roughly:
 
 ```
 SQLite ready — file:/data/bot.db (journal_mode=wal)
@@ -110,7 +149,7 @@ Bot Live via Webhook on port 10000
 Risk loop 1000ms | monitor loop 30000ms | mode DEMO
 ```
 
-## 6. Verify before trusting it with money
+## 7. Verify before trusting it with money
 
 In Telegram:
 
@@ -157,5 +196,7 @@ ask and I will write the importer.
 | `FATAL: no public URL set` | `PUBLIC_URL` unset — intentional, it refuses to guess |
 | Data gone after redeploy | No volume mounted at `/data`, or `DATABASE_URL` not pointing there |
 | Cards/charts are blank boxes | `assets/fonts/CardFont.ttf` missing from the image |
+| `database is locked` during deploy | Rolling update is on — the old container still holds the DB. Turn rolling update off. |
 | `SQLITE_BUSY` in logs | More than one replica running — scale back to 1 |
+| Table/column does not exist | Post-deployment migration command not set, or it failed |
 | Nothing buys in live mode | No wallet loaded; check `/settings` |

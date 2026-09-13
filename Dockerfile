@@ -69,6 +69,11 @@ EXPOSE 10000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
   CMD node -e "require('net').connect(Number(process.env.PORT)||10000,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"
 
-# migrate deploy applies committed migrations only — it never prompts and never
-# resets data, which is what makes it safe to run on every start.
-CMD ["sh", "-c", "npx prisma migrate deploy && node dist/bot.js"]
+# Migrations are NOT run here. SQLite allows a single writer, so running
+# `migrate deploy` at container start races the old container during a rolling
+# deploy and dies with "database is locked" -- which then prevents this
+# container going healthy, so the old one is never stopped. Deadlock.
+#
+# Migrations run as a post-deployment command instead, once the old container
+# is gone. See DEPLOY.md.
+CMD ["node", "dist/bot.js"]
