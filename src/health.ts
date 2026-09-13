@@ -81,6 +81,8 @@ export interface DbHealth {
   closedTradesLive: number;
   alertsTracked: number;
   writeOk: boolean;
+  /** Connected fine, but a migration has not been applied yet. */
+  migrationsPending: boolean;
   error?: string;
 }
 
@@ -105,6 +107,7 @@ export async function getDbHealth(): Promise<DbHealth> {
     closedTradesLive: 0,
     alertsTracked: 0,
     writeOk: false,
+    migrationsPending: false,
   };
 
   try {
@@ -116,8 +119,20 @@ export async function getDbHealth(): Promise<DbHealth> {
     const jm = await prisma.$queryRawUnsafe<Array<{ journal_mode: string }>>('PRAGMA journal_mode;');
     health.journalMode = jm?.[0]?.journal_mode ?? '?';
 
-    health.bootCount = Number(await getState(KEY_BOOT_COUNT)) || 0;
-    health.firstBootAt = Number(await getState(KEY_FIRST_BOOT)) || 0;
+    // app_state arrives in a migration, so it can legitimately be missing on a
+    // database that is otherwise healthy and full of data. Treating that as
+    // "DATABASE NOT WORKING" is alarming and wrong -- the connection is fine,
+    // the migration simply has not been applied yet.
+    try {
+      health.bootCount = Number(await getState(KEY_BOOT_COUNT)) || 0;
+      health.firstBootAt = Number(await getState(KEY_FIRST_BOOT)) || 0;
+    } catch (e: any) {
+      if (/does not exist|no such table/i.test(e.message || '')) {
+        health.migrationsPending = true;
+      } else {
+        throw e;
+      }
+    }
 
     const [open, pending, demo, live, alerts] = await Promise.all([
       prisma.activePosition.count({ where: { status: 'OPEN' } }),
@@ -135,8 +150,10 @@ export async function getDbHealth(): Promise<DbHealth> {
     // Prove writes actually land, not just that reads work. A read-only mount
     // or a full disk both present as a perfectly healthy-looking connection
     // until the first trade needs saving.
-    await setState('health_probe', String(Date.now()));
-    health.writeOk = true;
+    if (!health.migrationsPending) {
+      await setState('health_probe', String(Date.now()));
+      health.writeOk = true;
+    }
 
     health.ok = true;
   } catch (e: any) {
@@ -175,16 +192,50 @@ export function formatDbHealth(h: DbHealth): string {
   const lines: string[] = [
     'DATABASE',
     '',
-    'Status      connected, ' + (h.writeOk ? 'reads and writes OK' : 'READ ONLY - writes failing'),
+    'Status      connected, ' +
+      (h.migrationsPending
+        ? 'BUT MIGRATIONS ARE PENDING'
+        : h.writeOk
+        ? 'reads and writes OK'
+        : 'READ ONLY - writes failing'),
     'File        ' + (h.path || '?'),
     'Size        ' + formatSize(h.sizeBytes) + (h.exists ? '' : '  (file not found!)'),
     'Mode        ' + h.journalMode + (h.journalMode === 'wal' ? '' : '  (expected wal)'),
     '',
+  ];
+
+  if (h.migrationsPending) {
+    lines.push(
+      '',
+      'MIGRATIONS PENDING',
+      '',
+      'Your data is fine and the volume is mounted - the connection works and',
+      'the tables below are being read. One migration simply has not been',
+      'applied to this database yet.',
+      '',
+      'Run the post-deployment command:   npx prisma migrate deploy',
+      '',
+      'Persistence cannot be reported until that runs.'
+    );
+    lines.push(
+      '',
+      'CONTENTS',
+      '',
+      'Open positions   ' + h.openPositions,
+      'Pending entries  ' + h.pendingEntries,
+      'Closed trades    ' + h.closedTradesDemo + ' demo, ' + h.closedTradesLive + ' live',
+      'Alerts tracked   ' + h.alertsTracked
+    );
+    return lines.join('\n');
+  }
+
+  lines.push(
+    '',
     'PERSISTENCE',
     '',
     'Started     ' + h.bootCount + (h.bootCount === 1 ? ' time' : ' times'),
-    'First seen  ' + ago(h.firstBootAt),
-  ];
+    'First seen  ' + ago(h.firstBootAt)
+  );
 
   // The actual answer to "is my data safe across deploys".
   if (h.bootCount <= 1) {
