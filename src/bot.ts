@@ -23,6 +23,7 @@ import {
   loadPendingEntries,
 } from './positions';
 import { helpText, chunk } from './help';
+import { hasLorePotential, scoreLoreWithAI } from './lore';
 import { recordBoot, getDbHealth, formatDbHealth } from './health';
 import { TokenSignal } from './types';
 import { saveEncryptedWallet, loadDecryptedWallet } from './wallet';
@@ -437,41 +438,6 @@ function computeRugProbability(mcap: number, liquidity: number): number {
 // filters out anything too short/empty to even be a real story, THEN an
 // AI call judges only the survivors — keeps API usage cheap and bounded.
 // ─────────────────────────────────────────────────────────────────────────
-
-function hasLorePotential(description: string | undefined): boolean {
-  if (!description) return false;
-  const trimmed = description.trim();
-  if (trimmed.length < 60) return false; // too short to be a real story
-  const wordCount = trimmed.split(/\s+/).length;
-  return wordCount >= 12;
-}
-
-async function scoreLoreWithAI(ticker: string, description: string): Promise<number> {
-  const apiKey = process.env.GROQ_API_KEY;
-  if (!apiKey) return 0;
-  try {
-    const res = await axios.post('https://api.groq.com/openai/v1/chat/completions', {
-      model: 'llama-3.3-70b-versatile',
-      max_tokens: 10,
-      messages: [{
-        role: 'user',
-        content: `Rate how compelling and shareable this crypto token's story/lore is, on a scale of 0-100. A high score means a genuine, specific, unique narrative (real people, real events, a distinct concept) that could realistically go viral. A low score means generic, vague, templated, or copy-paste marketing language with no real story.\n\nToken: $${ticker}\nDescription: "${description}"\n\nRespond with ONLY a number from 0 to 100, nothing else.`
-      }]
-    }, {
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json'
-      },
-      timeout: 8000
-    });
-    const text = res.data?.choices?.[0]?.message?.content?.trim() || '0';
-    const score = parseInt(text, 10);
-    return isNaN(score) ? 0 : Math.min(100, Math.max(0, score));
-  } catch (e: any) {
-    console.log(`⚠️ Lore scoring failed for ${ticker}: ${e.message}`);
-    return 0;
-  }
-}
 
 function isReversalCandidate(pair: any): boolean {
   const h24 = parseFloat(pair.priceChange?.h24 || '0');
@@ -1365,8 +1331,13 @@ async function scan() {
         // ── Lore bonus: only tokens with an actual profile description
         // (currently just the 'profiles' source) are eligible, and only
         // ones that already pass the free heuristic filter get the AI call ──
-        if (p.description && hasLorePotential(p.description)) {
-          const loreScore = await scoreLoreWithAI(ticker, p.description);
+        // Only spend a Groq request when the boost could change the outcome.
+        // A token that stays below scoreMin even with +15 is skipped either
+        // way, so scoring it would burn free-tier allowance (1,000/day) for
+        // nothing. Tokens already above the line are still scored: the boost
+        // can lift them past 85, which doubles position size in risk.ts.
+        if (p.description && alphaScore + 15 >= scoreMin && hasLorePotential(p.description)) {
+          const loreScore = await scoreLoreWithAI(ticker, p.description, { address });
           if (loreScore >= 70) {
             alphaScore = Math.min(100, alphaScore + 15);
             console.log(`📖 Strong lore detected: ${ticker} (lore score ${loreScore}/100) — +15 alpha boost`);
